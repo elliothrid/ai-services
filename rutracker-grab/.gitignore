@@ -1,0 +1,6 @@
+.venv/
+.env
+*.torrent
+rules.local.json
+__pycache__/
+.pytest_cache/
