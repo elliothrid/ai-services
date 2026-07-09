@@ -28,6 +28,7 @@ EXIT_CODES = {
     "FsError": 7,
     "BadLink": 8,
     "PageLoadError": 9,
+    "TopicNotFound": 10,
 }
 
 

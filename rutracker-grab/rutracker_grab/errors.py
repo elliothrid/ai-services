@@ -23,6 +23,10 @@ class BadLink(GrabError):
     """Строка входа не похожа на ссылку на тему (нет `t=<id>`)."""
 
 
+class TopicNotFound(GrabError):
+    """На странице нет `h1.maintitle` — тема удалена, перенесена или это не viewtopic."""
+
+
 class ParseAmbiguous(GrabError):
     """Заголовок не прошёл инварианты §11 — на диск не пишем, нужен интерактив (§9)."""
 

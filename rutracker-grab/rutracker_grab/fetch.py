@@ -20,7 +20,7 @@ from . import config
 from .batch import read_links, run_batch
 from .cover import save_cover
 from .env_adapter import local_dir, qbit_save_path, sanitize_leaf
-from .errors import FsError, NotLoggedIn, PageLoadError, ParseAmbiguous
+from .errors import FsError, NotLoggedIn, PageLoadError, ParseAmbiguous, TopicNotFound
 from .page_saver import save_page_mhtml
 from .reconcile import MHTML_NAME, Report, reconcile
 from .title.parse import parse_title
@@ -51,11 +51,16 @@ def is_logged_in(page: Page) -> bool:
 
 
 def get_raw_title(page: Page) -> str:
-    """Сырой заголовок темы — текст `h1.maintitle`."""
+    """Сырой заголовок темы — текст `h1.maintitle`.
+
+    Нет заголовка -> `TopicNotFound` (а не голый RuntimeError): в списке ссылок
+    регулярно попадаются удалённые темы, и батч должен их классифицировать (§12).
+    """
     loc = page.locator(_TITLE_SELECTOR)
     if loc.count() == 0:
-        raise RuntimeError(
-            f"Не найден {_TITLE_SELECTOR} — это точно страница темы (viewtopic.php)?"
+        raise TopicNotFound(
+            f"не найден {_TITLE_SELECTOR} — тема удалена/перенесена "
+            f"или это не страница темы: {page.url}"
         )
     return loc.first.inner_text().strip()
 
@@ -350,16 +355,25 @@ def cmd_batch(
         print(f"В {links_file} нет ссылок (пустые строки и `#`-комментарии пропускаются).")
         return 0
 
+    def grab_in_fresh_page(url: str, *, force: bool = False):
+        """Своя вкладка на ссылку: после таймаута `goto` в странице остаётся висящая
+        навигация, и следующий `goto` встаёт за ней в очередь — одна битая ссылка
+        утаскивала за собой все последующие. Контекст (cookie, профиль) общий."""
+        page = context.new_page()
+        try:
+            return grab_one(context, page, url, force=force)
+        finally:
+            try:
+                page.close()
+            except PlaywrightError:  # вкладка уже мертва — не мешаем следующей ссылке
+                pass
+
     with sync_playwright() as p:
         context = _launch_context(p, headless=not headed)
-        page = context.new_page()
         try:
             with qbit_session():
                 summary = run_batch(
-                    links,
-                    grab=lambda url, *, force=False: grab_one(context, page, url, force=force),
-                    force=force,
-                    verbose=verbose,
+                    links, grab=grab_in_fresh_page, force=force, verbose=verbose
                 )
         finally:
             context.close()
