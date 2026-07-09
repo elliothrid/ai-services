@@ -33,7 +33,9 @@ class Prompter(Protocol):
     enabled: bool
 
     def answer(self, question: Question) -> str: ...
-    def confirm_clean_title(self, proposed: str, problems: list[str]) -> str: ...
+    def confirm_clean_title(
+        self, proposed: str, problems: list[str], raw: str | None = None
+    ) -> str: ...
     def choose_cover(self, candidates: list[str], *, has_img_right: bool) -> str | None: ...
     def note(self, message: str) -> None: ...
 
@@ -49,7 +51,9 @@ class AutoPrompter:
     def answer(self, question: Question) -> str:
         raise RuntimeError("AutoPrompter не отвечает на вопросы; проверяйте .enabled")
 
-    def confirm_clean_title(self, proposed: str, problems: list[str]) -> str:
+    def confirm_clean_title(
+        self, proposed: str, problems: list[str], raw: str | None = None
+    ) -> str:
         raise RuntimeError("AutoPrompter не подтверждает заголовок; проверяйте .enabled")
 
     def choose_cover(self, candidates: list[str], *, has_img_right: bool) -> str | None:
@@ -127,8 +131,14 @@ class ConsolePrompter:
         self._out(f"  -> {answer}, запомнено (больше не спрошу)")
         return answer
 
-    def confirm_clean_title(self, proposed: str, problems: list[str]) -> str:
+    def confirm_clean_title(
+        self, proposed: str, problems: list[str], raw: str | None = None
+    ) -> str:
         """Показать заголовок и путь папки, дать отредактировать. Вернуть валидное имя.
+
+        `raw` — заголовок темы до очистки: печатается рядом, чтобы решение о правке
+        принималось глазами, а не по памяти. Показывается на каждой итерации — он
+        единственная неизменная точка отсчёта, пока имя правят.
 
         Цикл не выпускает невалидное имя наружу: §11 — гейт, а не рекомендация.
         `s` пропускает тему (`ParseAmbiguous`), как в неинтерактивном режиме.
@@ -136,8 +146,10 @@ class ConsolePrompter:
         current = proposed
         while True:
             self._out("")
-            self._out(f"  Заголовок: {current}")
-            self._out(f"  Папка:     {sanitize_leaf(current)}")
+            if raw:
+                self._out(f"  Исходный заголовок: {raw}")
+            self._out(f"  Заголовок:          {current}")
+            self._out(f"  Папка:              {sanitize_leaf(current)}")
             for problem in problems:
                 self._out(f"  ! {problem}")
 

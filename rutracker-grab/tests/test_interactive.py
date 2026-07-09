@@ -135,6 +135,35 @@ def test_confirm_accepts_by_default():
     assert any("Папка:" in line for line in lines)  # путь показан ДО создания (§3)
 
 
+def test_confirm_shows_raw_title():
+    """Решение о правке принимается глазами: сырой заголовок рядом с очищенным."""
+    raw = "Фильм / Movie (Реж / Dir) [2020, США, драма, BDRip] Dub + Sub"
+    prompter, lines, _ = _console("\n")
+
+    prompter.confirm_clean_title(VALID, [], raw)
+
+    assert f"  Исходный заголовок: {raw}" in lines
+    assert f"  Заголовок:          {VALID}" in lines
+
+
+def test_raw_title_is_reshown_on_every_edit():
+    # Правим дважды: исходник остаётся точкой отсчёта на каждой итерации.
+    raw = "Фильм / Movie [2020, BDRip]"
+    prompter, lines, _ = _console("e\nБез года\ne\nС годом [2001]\n\n")
+
+    prompter.confirm_clean_title(VALID, [], raw)
+
+    assert sum(f"Исходный заголовок: {raw}" in line for line in lines) == 3
+
+
+def test_confirm_without_raw_omits_the_line():
+    prompter, lines, _ = _console("\n")
+
+    prompter.confirm_clean_title(VALID, [])
+
+    assert not any("Исходный заголовок" in line for line in lines)
+
+
 def test_edit_replaces_title():
     prompter, _, _ = _console("e\nДругое имя [1999]\n\n")
 

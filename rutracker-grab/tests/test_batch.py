@@ -12,6 +12,7 @@ import pytest
 from rutracker_grab.batch import (
     ERROR,
     OK,
+    SEPARATOR,
     SKIPPED,
     read_links,
     run_batch,
@@ -223,6 +224,61 @@ def test_progress_line_shape():
     run_batch([T1], grab=grab, out=lines.append)
 
     assert lines[0] == "[1/1] t=1111111   ok       Ешь. Молись. Худей [2026]"
+
+
+def test_announce_prints_header_before_work():
+    """Вопросы интерактива должны идти под своей ссылкой, а не под предыдущей."""
+    seen: list[str] = []
+
+    def grab(url, *, force=False):
+        seen.append(f"РАБОТА над {url}")
+        return _plan("Первая [2026]"), _report()
+
+    def record(line):
+        seen.append(line)
+
+    run_batch([T1], grab=grab, announce=True, out=record)
+
+    # Порядок: заголовок -> работа (где спрашивают) -> строка результата.
+    meaningful = [line for line in seen if line.strip()]
+    assert meaningful[0] == "[1/1] t=1111111   разбор…"
+    assert meaningful[1] == f"РАБОТА над {T1}"
+    assert meaningful[2].endswith("Первая [2026]")
+
+
+def test_separator_between_links_but_not_before_first():
+    grab = _FakeGrab({T1: (_plan(), _report()), T2: (_plan(), _report())})
+    lines: list[str] = []
+
+    run_batch([T1, T2], grab=grab, announce=True, out=lines.append)
+
+    # Разделитель ровно один — между ссылками, не перед первой и не после последней.
+    assert lines.count(SEPARATOR) == 1
+    assert lines.index(SEPARATOR) < lines.index("[2/2] t=2222222   разбор…")
+    assert lines.index(SEPARATOR) > lines.index("[1/2] t=1111111   разбор…")
+
+
+def test_no_announce_by_default():
+    grab = _FakeGrab({T1: (_plan(), _report())})
+    lines: list[str] = []
+
+    run_batch([T1], grab=grab, out=lines.append)
+
+    assert not any("разбор" in line for line in lines)  # без вопросов лишних строк нет
+    assert SEPARATOR not in lines
+
+
+def test_review_all_announces_both_phases():
+    fake = _FakeTwoPhase({T1: _plan()})
+    lines: list[str] = []
+
+    run_review_batch(
+        [T1], resolve=fake.resolve, execute=fake.execute, confirm=_yes,
+        announce=True, out=lines.append,
+    )
+
+    # Разбор и выполнение — обе фазы спрашивают (постер выбирается в фазе 2).
+    assert sum(line == "[1/1] t=1111111   разбор…" for line in lines) == 2
 
 
 def test_verbose_prints_artifact_lines():

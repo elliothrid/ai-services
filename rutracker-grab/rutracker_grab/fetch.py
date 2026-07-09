@@ -251,7 +251,8 @@ def _resolve(
     errors = validate(parts)
     if prompter.enabled:
         # Review-чекпоинт §3: показать имя и путь до создания папки, дать поправить.
-        clean = prompter.confirm_clean_title(parts.clean_title, errors)
+        # Сырой заголовок идёт рядом — по нему видно, что именно выбросила очистка.
+        clean = prompter.confirm_clean_title(parts.clean_title, errors, raw)
     elif errors:
         raise ParseAmbiguous("заголовок не прошёл инварианты §11: " + "; ".join(errors))
     else:
@@ -516,13 +517,18 @@ def cmd_batch(
 
     with _browser(headless=not headed) as context:
         with qbit_session():
+            # Заголовок до работы нужен только когда работа задаёт вопросы —
+            # иначе они печатаются под строкой результата предыдущей ссылки.
+            announce = prompter.enabled
             if review_all:
                 summary = run_review_batch(
                     links, resolve=resolve, execute=execute, confirm=confirm,
-                    force=force, verbose=verbose,
+                    force=force, verbose=verbose, announce=announce,
                 )
             else:
-                summary = run_batch(links, grab=grab, force=force, verbose=verbose)
+                summary = run_batch(
+                    links, grab=grab, force=force, verbose=verbose, announce=announce
+                )
     return summary.exit_code()
 
 

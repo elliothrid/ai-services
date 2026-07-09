@@ -165,6 +165,23 @@ def _isolated(summary: BatchSummary, url: str, index: int, total: int, work, out
         return False, None
 
 
+SEPARATOR = "»" * 80
+
+
+def _announce(out, index: int, total: int, url: str) -> None:
+    """Заголовок ДО работы над ссылкой.
+
+    Строка результата печатается после, поэтому в интерактиве вопросы всплывали
+    под строкой предыдущей ссылки — и выглядело, будто спрашивают про неё.
+    Между ссылками — разделитель: с вопросами вывод длинный, границы теряются.
+    """
+    if index > 1:
+        out("")
+        out(SEPARATOR)
+    out("")
+    out(f"[{index}/{total}] t={_topic_id_or_unknown(url):<9} разбор…")
+
+
 def _record_report(summary: BatchSummary, url: str, plan, report, index, total, verbose, out) -> None:
     result = LinkResult(
         url=url,
@@ -185,17 +202,21 @@ def run_batch(
     grab: _Grab,
     force: bool = False,
     verbose: bool = False,
+    announce: bool = False,
     out: Callable[[str], None] = print,
 ) -> BatchSummary:
     """Прогнать список ссылок. Сбой на одной не мешает остальным (§12).
 
     `grab(url, force=...)` должен вернуть `(plan, report)`. Любое исключение, кроме
     `NotLoggedIn`, ловится и попадает в сводку — батч едет дальше. `NotLoggedIn`
-    останавливает прогон.
+    останавливает прогон. `announce` печатает заголовок до работы (нужно, когда
+    работа задаёт вопросы: иначе они уезжают под строку предыдущей ссылки).
     """
     summary = BatchSummary()
     total = len(links)
     for index, url in enumerate(links, start=1):
+        if announce:
+            _announce(out, index, total, url)
         ok, value = _isolated(summary, url, index, total, lambda u=url: grab(u, force=force), out)
         if not ok:
             if summary.aborted:
@@ -226,6 +247,7 @@ def run_review_batch(
     confirm: Callable[[list[PlannedLink]], bool],
     force: bool = False,
     verbose: bool = False,
+    announce: bool = False,
     out: Callable[[str], None] = print,
 ) -> BatchSummary:
     """`--review-all`: сперва разобрать все ссылки, показать план, потом выполнять (§9).
@@ -242,6 +264,8 @@ def run_review_batch(
     planned: list[PlannedLink] = []
 
     for index, url in enumerate(links, start=1):
+        if announce:
+            _announce(out, index, total, url)
         ok, plan = _isolated(summary, url, index, total, lambda u=url: resolve(u), out)
         if not ok:
             if summary.aborted:
@@ -266,9 +290,13 @@ def run_review_batch(
             out(line)
         return summary
 
-    out("")
+    if not announce:
+        out("")   # с announce пустую строку печатает сам заголовок
     executed = len(planned)
     for index, item in enumerate(planned, start=1):
+        if announce:
+            # Фаза 2 тоже спрашивает: выбор постера (§6).
+            _announce(out, index, executed, item.url)
         ok, report = _isolated(
             summary, item.url, index, executed,
             lambda i=item: execute(i.url, i.plan, force=force), out,
