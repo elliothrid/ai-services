@@ -24,7 +24,7 @@ rutracker_grab/
   __main__.py  config.py  env_adapter.py  fetch.py  batch.py  errors.py
   title/ (parse.py normalize.py lexicons.py validate.py decisions.py)
   cover.py  page_saver.py  torrent.py  state.py  reconcile.py
-  interactive.py  rules.py
+  interactive.py  rules.py  lock.py
 tests/
 ```
 
@@ -58,6 +58,9 @@ CLI живёт в `__main__.py`; `python -m rutracker_grab.fetch` точкой �
   молча запускать запись на диск и в qBittorrent.
 - Из цикла правки имени нельзя выйти с именем, не прошедшим §11: только валидное
   имя или `s` (пропустить тему). Гейт — не рекомендация.
+- Один процесс на профиль браузера. Замок (`lock.profile_lock`) берётся ДО запуска
+  Chromium: второй процесс на том же `BROWSER_PROFILE_DIR` не видит cookie и врёт
+  про `NotLoggedIn`. Не запускать браузер, пока идёт другой прогон.
 
 ## Правила очистки заголовка (решено, детерминированно)
 - Схлопывание языков: брать сегмент до первого ` / ` (в названии и в скобке режиссёра).

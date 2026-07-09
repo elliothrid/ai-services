@@ -10,6 +10,7 @@ cookie логина между запусками (§6a). Сайт отдаёт 
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -29,6 +30,7 @@ from .interactive import (
     ask_yes_no,
     resolve_questions,
 )
+from .lock import profile_lock
 from .page_saver import save_page_mhtml
 from .reconcile import MHTML_NAME, Report, reconcile
 from .rules import LocalRules, load_rules
@@ -88,6 +90,22 @@ def _launch_context(playwright, *, headless: bool):
     )
 
 
+@contextmanager
+def _browser(*, headless: bool):
+    """Замок на профиль + persistent-context. Профиль занят -> `BrowserBusy` (§6a).
+
+    Замок берётся ДО запуска Chromium: иначе второй процесс поднимет браузер на том
+    же профиле, не увидит cookie и соврёт про `NotLoggedIn`.
+    """
+    with profile_lock():
+        with sync_playwright() as playwright:
+            context = _launch_context(playwright, headless=headless)
+            try:
+                yield context
+            finally:
+                context.close()
+
+
 # --- CLI-команды ------------------------------------------------------------
 
 def cmd_login() -> int:
@@ -95,8 +113,7 @@ def cmd_login() -> int:
 
     Ждём, пока пользователь закроет окно браузера — cookie сохранятся в профиле.
     """
-    with sync_playwright() as p:
-        context = _launch_context(p, headless=False)
+    with _browser(headless=False) as context:
         page = context.pages[0] if context.pages else context.new_page()
         page.goto(LOGIN_URL, wait_until="domcontentloaded")
         print(
@@ -154,8 +171,7 @@ def cmd_probe(url: str, *, headed: bool = False, verbose: bool = False) -> int:
     """
     raw: str | None = None
     logged_in = False
-    with sync_playwright() as p:
-        context = _launch_context(p, headless=not headed)
+    with _browser(headless=not headed) as context:
         page = context.new_page()
         try:
             _goto(page, url)
@@ -168,7 +184,6 @@ def cmd_probe(url: str, *, headed: bool = False, verbose: bool = False) -> int:
         finally:
             if verbose:
                 _print_diagnostics(context, page)
-            context.close()
 
     if not logged_in:
         raise NotLoggedIn(
@@ -259,16 +274,12 @@ def cmd_dry_fetch(url: str, *, headed: bool = False, verbose: bool = False) -> i
 
     Торрент НЕ качаем, qBittorrent не трогаем.
     """
-    with sync_playwright() as p:
-        context = _launch_context(p, headless=not headed)
+    with _browser(headless=not headed) as context:
         page = context.new_page()
-        try:
-            plan = _resolve(page, url)
-            mhtml, cover = _write_artifacts(page, context, plan.target)
-            if verbose:
-                _print_diagnostics(context, page)
-        finally:
-            context.close()
+        plan = _resolve(page, url)
+        mhtml, cover = _write_artifacts(page, context, plan.target)
+        if verbose:
+            _print_diagnostics(context, page)
 
     print(f"clean:     {plan.clean}")
     print(f"leaf:      {plan.leaf}")
@@ -417,18 +428,14 @@ def cmd_grab(
 ) -> int:
     """`--grab <url>`: реконсиляция одной раздачи с подробным выводом."""
     prompter, rules = _make_prompter(interactive)
-    with sync_playwright() as p:
-        context = _launch_context(p, headless=not headed)
+    with _browser(headless=not headed) as context:
         page = context.new_page()
-        try:
-            with qbit_session():
-                plan, report = grab_one(
-                    context, page, url, force=force, prompter=prompter, rules=rules
-                )
-            if verbose:
-                _print_diagnostics(context, page)
-        finally:
-            context.close()
+        with qbit_session():
+            plan, report = grab_one(
+                context, page, url, force=force, prompter=prompter, rules=rules
+            )
+        if verbose:
+            _print_diagnostics(context, page)
 
     if report.skipped:
         print(f"skipped: всё на месте, раздача в qBittorrent ({plan.target})")
@@ -507,19 +514,15 @@ def cmd_batch(
         _print_plan(planned)
         return ask_yes_no(f"Выполнить {len(planned)} шт.?", default=True)
 
-    with sync_playwright() as p:
-        context = _launch_context(p, headless=not headed)
-        try:
-            with qbit_session():
-                if review_all:
-                    summary = run_review_batch(
-                        links, resolve=resolve, execute=execute, confirm=confirm,
-                        force=force, verbose=verbose,
-                    )
-                else:
-                    summary = run_batch(links, grab=grab, force=force, verbose=verbose)
-        finally:
-            context.close()
+    with _browser(headless=not headed) as context:
+        with qbit_session():
+            if review_all:
+                summary = run_review_batch(
+                    links, resolve=resolve, execute=execute, confirm=confirm,
+                    force=force, verbose=verbose,
+                )
+            else:
+                summary = run_batch(links, grab=grab, force=force, verbose=verbose)
     return summary.exit_code()
 
 

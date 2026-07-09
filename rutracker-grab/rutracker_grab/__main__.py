@@ -29,6 +29,7 @@ EXIT_CODES = {
     "BadLink": 8,
     "PageLoadError": 9,
     "TopicNotFound": 10,
+    "BrowserBusy": 11,
 }
 
 
@@ -110,9 +111,10 @@ def main(argv: list[str] | None = None) -> int:
         flag = "--interactive" if args.interactive else "--review-all"
         parser.error(f"{flag} требует терминал: stdin не является TTY")
 
-    if args.login:
-        return cmd_login()
     try:
+        if args.login:
+            # Внутри try: --login тоже берёт замок профиля и может получить BrowserBusy.
+            return cmd_login()
         if args.links_file:
             return cmd_batch(
                 args.links_file,
