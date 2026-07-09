@@ -9,8 +9,13 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from . import lexicons
+from .decisions import Question
+
+if TYPE_CHECKING:  # только для типов: title/ не зависит от слоя правил в рантайме
+    from ..rules import LocalRules
 
 _PAREN_RE = re.compile(r"\(([^)]*)\)")
 _MULTISPACE_RE = re.compile(r"\s{2,}")
@@ -22,24 +27,31 @@ class NameNormalization:
 
     text: str
     warnings: list[str] = field(default_factory=list)
-    needs_user: list[str] = field(default_factory=list)
+    needs_user: list[Question] = field(default_factory=list)
 
 
-def normalize_name(name: str) -> NameNormalization:
+def normalize_name(name: str, rules: LocalRules | None = None) -> NameNormalization:
     """Шаг A2: обработать скобки внутри названия и заменить разделитель.
 
     - `(фильм первый)`, `(часть N)` — убрать (drop);
     - `(ТВ)`, `(OVA)`, `(TV)` — оставить (keep);
-    - незнакомая скобка — оставить как есть, но пометить needs_user (§5.2);
+    - незнакомая скобка — спросить пользователя (`needs_user`), если ответа ещё нет
+      в `rules.local.json`; до ответа оставляем как есть (§5.2, §9);
     - ` - ` между фрагментами -> `. ` (всегда, автоматически).
     """
     warnings: list[str] = []
-    needs_user: list[str] = []
+    needs_user: list[Question] = []
 
     out: list[str] = []
     last = 0
     for m in _PAREN_RE.finditer(name):
-        kind = lexicons.classify_name_paren(m.group(1))
+        inner = m.group(1).strip()
+        kind = lexicons.classify_name_paren(inner)
+        if kind == "unknown" and rules is not None:
+            learned = rules.name_paren(inner)
+            if learned is not None:
+                kind = "type" if learned == "keep" else "part"
+
         out.append(name[last:m.start()])
         if kind == "part":
             # drop: содержимое не добавляем; лишние пробелы схлопнутся ниже.
@@ -48,7 +60,7 @@ def normalize_name(name: str) -> NameNormalization:
             out.append(m.group(0))
         else:  # unknown -> фолбэк-вопрос (§5.2), пока оставляем как есть
             out.append(m.group(0))
-            needs_user.append(f"скобка названия не классифицирована: ({m.group(1).strip()})")
+            needs_user.append(Question(kind="name_paren", value=inner))
         last = m.end()
     out.append(name[last:])
 

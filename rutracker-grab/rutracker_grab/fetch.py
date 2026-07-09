@@ -21,8 +21,10 @@ from .batch import read_links, run_batch
 from .cover import save_cover
 from .env_adapter import local_dir, qbit_save_path, sanitize_leaf
 from .errors import FsError, NotLoggedIn, PageLoadError, ParseAmbiguous, TopicNotFound
+from .interactive import AutoPrompter, ConsolePrompter, Prompter, resolve_questions
 from .page_saver import save_page_mhtml
 from .reconcile import MHTML_NAME, Report, reconcile
+from .rules import LocalRules, load_rules
 from .title.parse import parse_title
 from .title.validate import validate
 from .torrent import (
@@ -198,24 +200,41 @@ def _goto(page: Page, url: str) -> None:
         ) from exc
 
 
-def _resolve(page: Page, url: str) -> _Plan:
+def _resolve(
+    page: Page,
+    url: str,
+    *,
+    prompter: Prompter | None = None,
+    rules: LocalRules | None = None,
+) -> _Plan:
     """Открыть тему, проверить логин, разобрать и провалидировать заголовок.
 
     Только вычисления и проверки — ничего на диск не пишет (нужно до идемпотент-чека).
+    В интерактивном режиме (§9) незакрытые решения закрываются вопросами, после чего
+    заголовок разбирается заново — уже с выученными правилами.
     """
+    prompter = prompter or AutoPrompter()
     _goto(page, url)
     if not is_logged_in(page):
         raise NotLoggedIn(
             "Не залогинены на rutracker (нет признака логина на странице).\n"
             "Запустите вход: python -m rutracker_grab --login"
         )
-    parts = parse_title(get_raw_title(page))
+
+    raw = get_raw_title(page)
+    parts = parse_title(raw, rules)
+    if resolve_questions(parts.needs_user, prompter):
+        parts = parse_title(raw, rules)  # переразбор с только что выученными правилами
 
     errors = validate(parts)
-    if errors:
+    if prompter.enabled:
+        # Review-чекпоинт §3: показать имя и путь до создания папки, дать поправить.
+        clean = prompter.confirm_clean_title(parts.clean_title, errors)
+    elif errors:
         raise ParseAmbiguous("заголовок не прошёл инварианты §11: " + "; ".join(errors))
+    else:
+        clean = parts.clean_title
 
-    clean = parts.clean_title
     leaf = sanitize_leaf(clean)      # одна строка для обоих потребителей (§2)
     return _Plan(clean, leaf, local_dir(leaf), qbit_save_path(leaf))
 
@@ -260,10 +279,11 @@ class _LiveDeps:
     этом может быть открыт, они не мешают друг другу.
     """
 
-    def __init__(self, context, page: Page, topic_id: str):
+    def __init__(self, context, page: Page, topic_id: str, prompter: Prompter):
         self._context = context
         self._page = page
         self._topic_id = topic_id
+        self._prompter = prompter
 
     def fetch_torrent(self) -> bytes:
         return fetch_torrent_bytes(self._context, self._topic_id)
@@ -272,7 +292,8 @@ class _LiveDeps:
         return save_page_mhtml(self._page, target / MHTML_NAME)
 
     def save_cover(self, target: Path) -> Path | None:
-        return save_cover(self._page, self._context, target)
+        chooser = self._prompter.choose_cover if self._prompter.enabled else None
+        return save_cover(self._page, self._context, target, chooser)
 
     def in_qbit(self, infohash: str) -> bool:
         return torrent_in_qbit(infohash)
@@ -284,7 +305,15 @@ class _LiveDeps:
         recheck_torrent(torrent_hash)
 
 
-def grab_one(context, page: Page, url: str, *, force: bool = False) -> tuple[_Plan, Report]:
+def grab_one(
+    context,
+    page: Page,
+    url: str,
+    *,
+    force: bool = False,
+    prompter: Prompter | None = None,
+    rules: LocalRules | None = None,
+) -> tuple[_Plan, Report]:
     """Обработать одну тему в уже открытом контексте (§10).
 
     Каждый артефакт (папка, About.mhtml, folder.jpg, `<leaf>.torrent`, `.grab.json`)
@@ -293,8 +322,9 @@ def grab_one(context, page: Page, url: str, *, force: bool = False) -> tuple[_Pl
 
     Ничего не печатает — это делает вызывающий (одиночный `--grab` или батч).
     """
+    prompter = prompter or AutoPrompter()
     tid = topic_id_from_url(url)
-    plan = _resolve(page, url)
+    plan = _resolve(page, url, prompter=prompter, rules=rules)
     try:
         report = reconcile(
             target=plan.target,
@@ -302,7 +332,7 @@ def grab_one(context, page: Page, url: str, *, force: bool = False) -> tuple[_Pl
             clean=plan.clean,
             qbit_save=plan.qbit_save,
             topic_id=tid,
-            deps=_LiveDeps(context, page, tid),
+            deps=_LiveDeps(context, page, tid, prompter),
             force=force,
         )
     except OSError as exc:  # SMB отвалился, нет прав, длинный путь (§12)
@@ -315,16 +345,32 @@ def grab_one(context, page: Page, url: str, *, force: bool = False) -> tuple[_Pl
     return plan, report
 
 
+def _make_prompter(interactive: bool) -> tuple[Prompter, LocalRules]:
+    """Промптер и выученные правила (§9). Правила читаем всегда — они и без вопросов
+    закрывают то, на что уже отвечали раньше."""
+    rules = load_rules()
+    prompter = ConsolePrompter(rules) if interactive else AutoPrompter()
+    return prompter, rules
+
+
 def cmd_grab(
-    url: str, *, headed: bool = False, verbose: bool = False, force: bool = False
+    url: str,
+    *,
+    headed: bool = False,
+    verbose: bool = False,
+    force: bool = False,
+    interactive: bool = False,
 ) -> int:
     """`--grab <url>`: реконсиляция одной раздачи с подробным выводом."""
+    prompter, rules = _make_prompter(interactive)
     with sync_playwright() as p:
         context = _launch_context(p, headless=not headed)
         page = context.new_page()
         try:
             with qbit_session():
-                plan, report = grab_one(context, page, url, force=force)
+                plan, report = grab_one(
+                    context, page, url, force=force, prompter=prompter, rules=rules
+                )
             if verbose:
                 _print_diagnostics(context, page)
         finally:
@@ -342,18 +388,25 @@ def cmd_grab(
 
 
 def cmd_batch(
-    links_file: str, *, headed: bool = False, verbose: bool = False, force: bool = False
+    links_file: str,
+    *,
+    headed: bool = False,
+    verbose: bool = False,
+    force: bool = False,
+    interactive: bool = False,
 ) -> int:
     """`<links.txt>`: прогнать список ссылок в одном браузере и одной сессии qBittorrent.
 
     Один persistent-context и одно подключение к qBittorrent на весь батч (§3, п.5):
     поднимать браузер на каждую ссылку — секунды впустую, да и два процесса на одном
-    профиле не уживаются.
+    профиле не уживаются. С `--interactive` вопросы задаются по ходу, на своей теме.
     """
     links = read_links(Path(links_file))
     if not links:
         print(f"В {links_file} нет ссылок (пустые строки и `#`-комментарии пропускаются).")
         return 0
+
+    prompter, rules = _make_prompter(interactive)
 
     def grab_in_fresh_page(url: str, *, force: bool = False):
         """Своя вкладка на ссылку: после таймаута `goto` в странице остаётся висящая
@@ -361,7 +414,7 @@ def cmd_batch(
         утаскивала за собой все последующие. Контекст (cookie, профиль) общий."""
         page = context.new_page()
         try:
-            return grab_one(context, page, url, force=force)
+            return grab_one(context, page, url, force=force, prompter=prompter, rules=rules)
         finally:
             try:
                 page.close()

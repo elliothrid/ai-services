@@ -14,17 +14,17 @@
 - **Детерминизм по умолчанию.** LLM — только на «нечётких» местах (§5.2), за
   интерфейсом `normalize.py`; стартовый провайдер = `none` (правила + интерактив).
 - **Ничего не пишем на диск / в qBittorrent, минуя валидаторы-инварианты (§11).**
-- Инструмент задуман интерактивным: если правило неоднозначно — спросить
-  пользователя, не угадывать молча. **`interactive.py` пока не написан**, поэтому
-  неоднозначность = ошибка `ParseAmbiguous`, тема пропускается (§9, §12).
+- Не угадывать молча. Неоднозначность парсер кладёт в `TitleParts.needs_user`
+  (`Question`): с `--interactive` — вопрос пользователю, без него — предупреждение,
+  а нарушение §11 = `ParseAmbiguous` и тема пропускается (§9, §12).
 
 ## Структура (см. DESIGN.md §13)
 ```
 rutracker_grab/
   __main__.py  config.py  env_adapter.py  fetch.py  batch.py  errors.py
-  title/ (parse.py normalize.py lexicons.py validate.py)
+  title/ (parse.py normalize.py lexicons.py validate.py decisions.py)
   cover.py  page_saver.py  torrent.py  state.py  reconcile.py
-  interactive.py — НЕ НАПИСАН (§9)
+  interactive.py  rules.py
 tests/
 ```
 
@@ -52,6 +52,11 @@ CLI живёт в `__main__.py`; `python -m rutracker_grab.fetch` точкой �
   иначе изоляция §12 не работает. То же про голые `RuntimeError`/`ValueError`.
 - Явный `timeout=` на каждом `context.request.get`: дефолт Playwright — 30 с, а
   через SOCKS5 и `dl.php`, и постеры с fastpic отвечают медленнее (§6).
+- `--interactive` требует TTY (проверка в `__main__`). Без неё батч из планировщика
+  молча повиснет на первом вопросе. `ConsolePrompter` на EOF бросает
+  `ParseAmbiguous`, а не крутит вечный цикл.
+- Из цикла правки имени нельзя выйти с именем, не прошедшим §11: только валидное
+  имя или `s` (пропустить тему). Гейт — не рекомендация.
 
 ## Правила очистки заголовка (решено, детерминированно)
 - Схлопывание языков: брать сегмент до первого ` / ` (в названии и в скобке режиссёра).

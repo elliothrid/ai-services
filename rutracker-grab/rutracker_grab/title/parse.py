@@ -9,10 +9,14 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from . import lexicons
+from .decisions import Question
 from .normalize import normalize_name
+
+if TYPE_CHECKING:  # только для типов: title/ не тянет слой правил в рантайме
+    from ..rules import LocalRules
 
 BracketKind = Literal["TYPE", "EPISODES", "MAIN", "RESOLUTION", "AUDIO_SUB", "UNKNOWN"]
 
@@ -41,7 +45,7 @@ class TitleParts:
     main_had_format: bool = False
     dropped: list[str] = field(default_factory=list)   # страны/жанры/аудио/сабы/хвост
     warnings: list[str] = field(default_factory=list)
-    needs_user: list[str] = field(default_factory=list)
+    needs_user: list[Question] = field(default_factory=list)  # незакрытые решения (§5.2)
     clean_title: str = ""
 
 
@@ -88,6 +92,20 @@ def classify_bracket(content: str) -> BracketKind:
     return "UNKNOWN"
 
 
+def _render_unknown(content: str, rules: LocalRules | None) -> tuple[str | None, bool]:
+    """Что делать с UNKNOWN-скобкой: `(rendered, нужен_ли_вопрос)`.
+
+    Выученный ответ (§9): `drop` — выбросить, `keep`/`tech` — оставить как есть.
+    Ответа нет -> оставляем как есть и задаём вопрос (не угадываем молча).
+    """
+    learned = rules.bracket(content) if rules is not None else None
+    if learned == "drop":
+        return None, False
+    if learned in ("keep", "tech"):
+        return f"[{content}]", False
+    return f"[{content}]", True
+
+
 def _find_year(content: str) -> str | None:
     """Первый 4-значный токен-год в диапазоне 1900–2100."""
     for m in lexicons.YEAR_RE.finditer(content):
@@ -99,11 +117,14 @@ def _find_year(content: str) -> str | None:
 
 # --- Шаг C: трансформация MAIN ---------------------------------------------
 
-def transform_main(content: str) -> tuple[str | None, str, bool, list[str]]:
+def transform_main(
+    content: str, extra_tech: tuple[str, ...] = ()
+) -> tuple[str | None, str, bool, list[str]]:
     """MAIN-скобка -> (year, tech, had_format, dropped).
 
     Токены делятся запятыми. year = первый 4-значный токен. tech = от первого
     TECH-токена до конца. Всё между годом и tech (страны/жанры) — выбрасывается.
+    `extra_tech` — формат-слова, выученные у пользователя (§9).
     """
     tokens = [t.strip() for t in content.split(",") if t.strip()]
 
@@ -115,7 +136,7 @@ def transform_main(content: str) -> tuple[str | None, str, bool, list[str]]:
 
     tech_start: int | None = None
     for i, t in enumerate(tokens):
-        if lexicons.is_tech_start(t):
+        if lexicons.is_tech_start(t, extra_tech):
             tech_start = i
             break
 
@@ -135,11 +156,16 @@ def transform_main(content: str) -> tuple[str | None, str, bool, list[str]]:
 
 # --- Оркестрация: A -> A2 -> B -> C -> D -> E ------------------------------
 
-def parse_title(raw: str) -> TitleParts:
-    """Разобрать сырой заголовок в TitleParts + собрать clean_title."""
+def parse_title(raw: str, rules: LocalRules | None = None) -> TitleParts:
+    """Разобрать сырой заголовок в TitleParts + собрать clean_title.
+
+    `rules` — ответы, выученные у пользователя (§9). С ними часть вопросов уже
+    закрыта: незнакомая скобка выбрасывается/остаётся без повторного вопроса.
+    """
     warnings: list[str] = []
-    needs_user: list[str] = []
+    needs_user: list[Question] = []
     dropped: list[str] = []
+    extra_tech = rules.extra_tech() if rules is not None else ()
 
     head, rest = _split_head(raw)
 
@@ -149,7 +175,7 @@ def parse_title(raw: str) -> TitleParts:
     director = _collapse_language(director_raw) if director_raw else None
 
     # Шаг A2: нормализация названия
-    norm = normalize_name(name)
+    norm = normalize_name(name, rules)
     ru_title = norm.text
     warnings.extend(norm.warnings)
     needs_user.extend(norm.needs_user)
@@ -166,7 +192,7 @@ def parse_title(raw: str) -> TitleParts:
         if kind in ("TYPE", "EPISODES", "RESOLUTION"):
             brackets.append(Bracket(kind=kind, raw=content, rendered=f"[{content}]"))
         elif kind == "MAIN":
-            year, tech, main_had_format, main_dropped = transform_main(content)
+            year, tech, main_had_format, main_dropped = transform_main(content, extra_tech)
             dropped.extend(main_dropped)
             rendered = f"[{year}]"
             if tech:
@@ -175,9 +201,13 @@ def parse_title(raw: str) -> TitleParts:
         elif kind == "AUDIO_SUB":
             dropped.append(content)
             brackets.append(Bracket(kind=kind, raw=content, rendered=None))
-        else:  # UNKNOWN -> интерактив/LLM (§5.2); пока оставляем как есть + флаг
-            needs_user.append(f"скобка не классифицирована: [{content}]")
-            brackets.append(Bracket(kind=kind, raw=content, rendered=f"[{content}]"))
+        else:  # UNKNOWN -> выученный ответ (§9) или вопрос пользователю (§5.2)
+            rendered, ask = _render_unknown(content, rules)
+            if ask:
+                needs_user.append(Question(kind="bracket", value=content))
+            if rendered is None:
+                dropped.append(content)
+            brackets.append(Bracket(kind=kind, raw=content, rendered=rendered))
 
     # Шаг D: хвост после последней `]` — выбрасывается (не рендерим ничего).
 

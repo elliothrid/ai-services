@@ -26,6 +26,9 @@ QBIT_PASSWORD = os.environ.get("QBIT_PASSWORD", "")
 # Версия правил очистки заголовка — пишется в манифест .grab.json (§10).
 RULES_VERSION = 1
 
+# Выученные у пользователя ответы про скобки (§9). Личный файл, в git не идёт.
+RULES_LOCAL_PATH = Path(__file__).resolve().parent.parent / "rules.local.json"
+
 # Сеть: Happ как локальный SOCKS5, только для Playwright (§6a).
 SOCKS5_PORT = 10808
 SOCKS5_PROXY = f"socks5://127.0.0.1:{SOCKS5_PORT}"

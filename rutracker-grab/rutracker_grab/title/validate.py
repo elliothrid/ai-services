@@ -27,10 +27,42 @@ def sanitize_leaf(name: str) -> str:
     return cleaned.rstrip(" .")
 
 
+def validate_clean_title(clean: str) -> list[str]:
+    """Инварианты §11, проверяемые по одной итоговой строке `clean_title`.
+
+    Отдельно от `validate`, потому что в интерактиве (§9) пользователь правит
+    заголовок руками: разобранных `TitleParts` для его версии уже нет, а имя
+    папки всё равно обязано быть легальным.
+    """
+    errors: list[str] = []
+
+    if not clean.strip():
+        errors.append("имя пустое")
+
+    years = _YEAR_BRACKET_RE.findall(clean)
+    if len(years) != 1:
+        errors.append(f"ожидалась ровно одна [год]-скобка, найдено {len(years)}")
+    else:
+        y = int(years[0])
+        if not (1900 <= y <= 2100):
+            errors.append(f"год вне диапазона 1900–2100: {y}")
+
+    # Санитизация не должна менять имя (тихое расхождение недопустимо, §2)
+    leaf = sanitize_leaf(clean)
+    if leaf != clean:
+        errors.append(f"санитизация изменила имя: {clean!r} -> {leaf!r}")
+
+    if len(leaf) > _MAX_LEAF_LEN:
+        errors.append(f"имя папки длиннее {_MAX_LEAF_LEN}: {len(leaf)}")
+    if clean != clean.rstrip(" ."):
+        errors.append("имя оканчивается на `.` или пробел")
+
+    return errors
+
+
 def validate(parts: TitleParts) -> list[str]:
     """Проверить инварианты §11. Вернуть список нарушений (пусто => ок)."""
     errors: list[str] = []
-    clean = parts.clean_title
 
     # ru_title не пустой
     if not parts.ru_title.strip():
@@ -42,28 +74,11 @@ def validate(parts: TitleParts) -> list[str]:
     if parts.director and " / " in parts.director:
         errors.append(f"языковой хвост в director: {parts.director!r}")
 
-    # Ровно одна [год]-скобка, год 1900–2100
-    years = _YEAR_BRACKET_RE.findall(clean)
-    if len(years) != 1:
-        errors.append(f"ожидалась ровно одна [год]-скобка, найдено {len(years)}")
-    else:
-        y = int(years[0])
-        if not (1900 <= y <= 2100):
-            errors.append(f"год вне диапазона 1900–2100: {y}")
-
     # tech непустой, если в исходной MAIN был формат-токен
     if parts.main_had_format and not (parts.tech or "").strip():
         errors.append("MAIN содержал формат-токен, но tech пуст")
 
-    # Санитизация не должна менять имя (тихое расхождение недопустимо, §2)
-    leaf = sanitize_leaf(clean)
-    if leaf != clean:
-        errors.append(f"санитизация изменила имя: {clean!r} -> {leaf!r}")
-
-    # Длина и хвостовые `.`/пробелы
-    if len(leaf) > _MAX_LEAF_LEN:
-        errors.append(f"имя папки длиннее {_MAX_LEAF_LEN}: {len(leaf)}")
-    if clean != clean.rstrip(" ."):
-        errors.append("имя оканчивается на `.` или пробел")
+    # Инварианты итоговой строки (год, санитизация, длина, хвостовые `.`/пробелы)
+    errors.extend(validate_clean_title(parts.clean_title))
 
     return errors

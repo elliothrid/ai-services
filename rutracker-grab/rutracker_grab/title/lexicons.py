@@ -52,10 +52,15 @@ TECH_HDR: tuple[str, ...] = ("SDR", "HDR10+", "HDR10", "HDR", "Dolby Vision", "D
 TECH_RESOLUTION: tuple[str, ...] = ("2160p", "1080p", "720p", "480p", "4K")
 
 
-def is_tech_start(token: str) -> bool:
-    """Токен начинается с формат-слова из лексикона (запускает tech)."""
+def is_tech_start(token: str, extra: tuple[str, ...] = ()) -> bool:
+    """Токен начинается с формат-слова (запускает tech).
+
+    `extra` — формат-слова, выученные у пользователя (`rules.local.json`, §9):
+    ответ «tech» про незнакомую скобку добавляет её первое слово сюда.
+    """
     low = token.strip().lower()
-    return any(low.startswith(fmt.lower()) for fmt in TECH_FORMATS)
+    formats = tuple(f.lower() for f in TECH_FORMATS) + tuple(e.lower() for e in extra)
+    return any(low.startswith(fmt) for fmt in formats)
 
 
 # --- Аудио/саб-маркеры (Шаг B: AUDIO_SUB drop) -----------------------------

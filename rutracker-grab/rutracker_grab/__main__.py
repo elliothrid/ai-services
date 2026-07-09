@@ -72,6 +72,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="для --grab и батча: игнорировать все проверки, перекачать и перезаписать всё (§10)",
     )
+    parser.add_argument(
+        "--interactive",
+        action="store_true",
+        help="спрашивать при неоднозначности: подтвердить/поправить имя, "
+        "классифицировать скобки, выбрать постер. Ответы копятся в rules.local.json (§9)",
+    )
     return parser
 
 
@@ -91,19 +97,30 @@ def main(argv: list[str] | None = None) -> int:
                      "--login | --probe | --dry-fetch | --grab")
     if args.links_file and any(commands[1:]):
         parser.error("файл со ссылками нельзя совмещать с --login/--probe/--dry-fetch/--grab")
+    if args.interactive and not sys.stdin.isatty():
+        # Иначе прогон из планировщика/пайпа молча повиснет на первом же вопросе.
+        parser.error("--interactive требует терминал: stdin не является TTY")
 
     if args.login:
         return cmd_login()
     try:
         if args.links_file:
             return cmd_batch(
-                args.links_file, headed=args.headed, verbose=args.verbose, force=args.force
+                args.links_file,
+                headed=args.headed,
+                verbose=args.verbose,
+                force=args.force,
+                interactive=args.interactive,
             )
         if args.dry_fetch:
             return cmd_dry_fetch(args.dry_fetch, headed=args.headed, verbose=args.verbose)
         if args.grab:
             return cmd_grab(
-                args.grab, headed=args.headed, verbose=args.verbose, force=args.force
+                args.grab,
+                headed=args.headed,
+                verbose=args.verbose,
+                force=args.force,
+                interactive=args.interactive,
             )
         return cmd_probe(args.probe, headed=args.headed, verbose=args.verbose)
     except GrabError as exc:
