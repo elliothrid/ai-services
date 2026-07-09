@@ -65,6 +65,20 @@ fetch -> parse_title -> [interactive resolve] -> make_dir
 
 Каждый шаг идемпотентен и логируется. Ошибка на одной ссылке не роняет пачку.
 
+**Батч.** `python -m rutracker_grab links.txt` — ссылки построчно, пустые строки и
+`#`-комментарии пропускаются, дубли снимаются по `topic_id`. `--force` применяется
+ко всем ссылкам. На каждую ссылку — одна строка прогресса (`ok` / `skipped` /
+`error`), разбор по артефактам — только под `--verbose`. В конце — сводка со
+счётчиками и списком проблемных ссылок в формате, который можно скормить обратно
+(причина — `#`-комментарием над ссылкой). Exit-код: 0 — чисто, 1 — были ошибки,
+2 — батч прерван (`NotLoggedIn`).
+
+**Один браузер и одна сессия qBittorrent на весь батч**: persistent-context
+поднимается один раз (два процесса на одном профиле не уживаются), подключение к
+qBittorrent живёт в `torrent.qbit_session()`. Логин в qBittorrent ленивый — иначе
+недоступный qBittorrent ронял бы батч ещё до разбора первой ссылки, а по §12 это
+ошибка одной темы, а не всего прогона.
+
 Чекпоинты для пользователя (по образцу scope / review / approval из
 confluence-yaml-agent):
 
@@ -199,7 +213,12 @@ https://support.claude.com/en/articles/15036540-use-the-claude-agent-sdk-with-yo
 - Селектор: первый `div.post_body img.postImg.img-right` (во всех 4 примерах
   постер именно с классом `img-right`).
 - Берём `@src`, отрезаем query (`?r=...`), качаем оригинал через
-  `context.request.get` (те же cookie).
+  `context.request.get` (те же cookie), с явным `timeout=config.REQUEST_TIMEOUT_MS`:
+  постеры лежат на fastpic/imageban, дефолтных 30 с через SOCKS5 не хватает.
+- **Мягкая деградация.** Постера нет на странице -> `None`, это штатно. Постер есть,
+  но не скачался/не декодировался -> `CoverUnavailable`, которую `reconcile` гасит:
+  тема доводится до конца (`.torrent`, qBittorrent, манифест), `folder.jpg` не
+  создаётся, следующий прогон его доберёт (§10). Терять раздачу из-за картинки нельзя.
 - **Всегда сохраняем `folder.jpg` (решено):** любой исходный формат (png/webp/…)
   декодировать через Pillow, при наличии альфы сплющить на белый фон (RGBA->RGB),
   сохранить JPEG quality ~90. Требует зависимости `Pillow`.
@@ -332,9 +351,21 @@ Happ работает как **локальный SOCKS5-прокси** (нас�
 ## 12. Обработка ошибок
 
 - Пер-ссылочная изоляция: `try/except` вокруг обработки одной темы, агрегируемый
-  отчёт в конце (ok / skipped / needs_user / error).
-- Классы ошибок: `NotLoggedIn` (-> подсказать `--login`), `TorrentNotBittorrent`,
-  `ParseAmbiguous` (-> интерактив), `QbitRejected`, `FsError`.
+  отчёт в конце (ok / skipped / error), сгруппированный по типу ошибки.
+- Все классы — в `errors.py`, общая база `GrabError` (её и ловит батч).
+- `NotLoggedIn` (-> подсказать `--login`) — **прерывает батч**: остальные ссылки
+  упадут с той же ошибкой, печатать её N раз бессмысленно.
+- Изолируются: `BadLink` (строка без `t=<id>`), `ParseAmbiguous` (гейт §11 ->
+  интерактив), `PageLoadError`, `TorrentNotBittorrent`, `QbitAuthError`,
+  `QbitRejected`, `FsError`.
+- `PageLoadError` оборачивает `playwright.sync_api.Error` (и `TimeoutError`):
+  голое исключение Playwright — не `GrabError` и роняло весь батч.
+- Батч ловит и любое неожиданное `Exception`, кладя имя класса в сводку: изоляция
+  важнее аккуратности. `KeyboardInterrupt` — `BaseException`, Ctrl+C работает.
+- `QbitAlreadyPresent` (409) наружу не выходит — это `skipped` внутри `reconcile`.
+- Exit-коды одиночных команд: 2 `NotLoggedIn`, 3 `ParseAmbiguous`,
+  4 `TorrentNotBittorrent`, 5 `QbitAuthError`, 6 `QbitRejected`, 7 `FsError`,
+  8 `BadLink`, 9 `PageLoadError`. Код 1 — «батч завершился с ошибками».
 
 ---
 
@@ -342,7 +373,9 @@ Happ работает как **локальный SOCKS5-прокси** (нас�
 
 ```
 rutracker_grab/
-  __main__.py          # CLI, режимы, чтение входа
+  __main__.py          # CLI: argparse, режимы, exit-коды (§3,§12)
+  batch.py             # список ссылок, изоляция, сводка   (§3,§12)
+  errors.py            # классы ошибок, база GrabError      (§12)
   config.py            # креды, пути, лексиконы, режимы
   env_adapter.py       # local/nas/qbit трансляция путей   (§2)
   fetch.py             # Playwright persistent-context, login, рендер   (§3,§8)

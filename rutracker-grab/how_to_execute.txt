@@ -1,0 +1,23 @@
+Execute in Power Shell terminal, from the rutracker-grab/ directory.
+
+Вход в rutracker (один раз, окно закрыть руками после логина):
+
+    ..\.venv\Scripts\python.exe -m rutracker_grab --login
+
+Батч по списку ссылок (пустые строки и `#`-комментарии пропускаются):
+
+    ..\.venv\Scripts\python.exe -m rutracker_grab links.txt
+
+Полезные флаги:
+
+    --verbose   разбор по артефактам на каждую ссылку
+    --force     перекачать и перезаписать всё, игнорируя проверки
+    --headed    показать окно браузера
+
+Одна ссылка:
+
+    ..\.venv\Scripts\python.exe -m rutracker_grab --grab https://rutracker.org/forum/viewtopic.php?t=6870556
+
+Exit-код батча: 0 — чисто, 1 — были ошибки, 2 — прерван (не залогинены).
+Проблемные ссылки печатаются в конце в формате, готовом для повторного запуска:
+сохраните блок в файл и скормите его обратно.

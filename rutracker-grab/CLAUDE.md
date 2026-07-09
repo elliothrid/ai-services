@@ -20,11 +20,14 @@
 ## Целевая структура (см. DESIGN.md §13)
 ```
 rutracker_grab/
-  __main__.py  config.py  env_adapter.py  fetch.py
+  __main__.py  config.py  env_adapter.py  fetch.py  batch.py  errors.py
   title/ (parse.py normalize.py lexicons.py validate.py)
   cover.py  page_saver.py  torrent.py  interactive.py  state.py  reconcile.py
 tests/
 ```
+
+Запуск батча: `python -m rutracker_grab links.txt` (см. `how_to_execute.txt`).
+Все ожидаемые ошибки наследуют `errors.GrabError` — батч ловит базовый класс.
 
 ## Ключевые инварианты (не нарушать)
 - `leaf` (имя папки) байт-в-байт одинаков в SMB-mkdir и в qBittorrent `save_path`.

@@ -1,7 +1,7 @@
 """Playwright persistent-context, логин, рендер и полный пайплайн (DESIGN.md §3, §6a, §8).
 
-CLI: `--login` (headed-вход), `--probe` (чтение заголовка), `--dry-fetch` (папка +
-страница + постер, без торрента), `--grab` (полный пайплайн до закачки в qBittorrent).
+Здесь — команды (`cmd_login`, `cmd_probe`, `cmd_dry_fetch`, `cmd_grab`, `cmd_batch`)
+и работа над одной темой (`grab_one`). Разбор аргументов и exit-коды — в `__main__.py`.
 
 Сеть: Chromium ходит через локальный SOCKS5 (Happ), персистентный профиль хранит
 cookie логина между запусками (§6a). Сайт отдаёт `charset=windows-1251`, но браузер
@@ -10,26 +10,25 @@ cookie логина между запусками (§6a). Сайт отдаёт 
 
 from __future__ import annotations
 
-import argparse
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import Page, sync_playwright
 
 from . import config
+from .batch import read_links, run_batch
 from .cover import save_cover
 from .env_adapter import local_dir, qbit_save_path, sanitize_leaf
+from .errors import FsError, NotLoggedIn, PageLoadError, ParseAmbiguous
 from .page_saver import save_page_mhtml
-from .reconcile import MHTML_NAME, reconcile
+from .reconcile import MHTML_NAME, Report, reconcile
 from .title.parse import parse_title
 from .title.validate import validate
 from .torrent import (
-    QbitAuthError,
-    QbitRejected,
-    TorrentNotBittorrent,
     add_to_qbit,
     fetch_torrent_bytes,
+    qbit_session,
     recheck_torrent,
     topic_id_from_url,
     torrent_in_qbit,
@@ -42,14 +41,6 @@ LOGIN_URL = "https://rutracker.org/forum/login.php"
 # ссылки `logout=` на странице темы нет (подтверждено дампом), потому не годится.
 _LOGGED_IN_SELECTOR = "#logged-in-username, a[href*='mode=editprofile']"
 _TITLE_SELECTOR = "h1.maintitle"
-
-
-class NotLoggedIn(RuntimeError):
-    """Сессия не залогинена — нужен `--login` (DESIGN.md §12)."""
-
-
-class ValidationFailed(RuntimeError):
-    """Заголовок не прошёл инварианты §11 — на диск не пишем (уходило бы в интерактив)."""
 
 
 # --- Проверки страницы ------------------------------------------------------
@@ -153,7 +144,7 @@ def cmd_probe(url: str, *, headed: bool = False, verbose: bool = False) -> int:
         context = _launch_context(p, headless=not headed)
         page = context.new_page()
         try:
-            page.goto(url, wait_until="domcontentloaded")
+            _goto(page, url)
             logged_in = is_logged_in(page)
             if logged_in:
                 raw = get_raw_title(page)
@@ -168,7 +159,7 @@ def cmd_probe(url: str, *, headed: bool = False, verbose: bool = False) -> int:
     if not logged_in:
         raise NotLoggedIn(
             "Не залогинены на rutracker (нет признака логина на странице).\n"
-            "Запустите вход: python -m rutracker_grab.fetch --login"
+            "Запустите вход: python -m rutracker_grab --login"
         )
 
     print(f"raw:   {raw}")
@@ -186,24 +177,38 @@ class _Plan:
     qbit_save: str
 
 
+def _goto(page: Page, url: str) -> None:
+    """Открыть страницу, переведя ошибки браузера в `PageLoadError` (§12).
+
+    `wait_until="domcontentloaded"`, а не `"load"`: на странице крутится реклама, и
+    ждать все подресурсы — значит регулярно упираться в таймаут. Для заголовка и
+    признака логина хватает DOM, а ленивые постеры прогревает `page_saver` (§7).
+    """
+    try:
+        page.goto(url, wait_until="domcontentloaded", timeout=config.PAGE_TIMEOUT_MS)
+    except PlaywrightError as exc:
+        raise PageLoadError(
+            f"страница не открылась за {config.PAGE_TIMEOUT_MS // 1000} с: {url}\n"
+            f"{type(exc).__name__}: {str(exc).splitlines()[0]}"
+        ) from exc
+
+
 def _resolve(page: Page, url: str) -> _Plan:
     """Открыть тему, проверить логин, разобрать и провалидировать заголовок.
 
     Только вычисления и проверки — ничего на диск не пишет (нужно до идемпотент-чека).
     """
-    page.goto(url, wait_until="load")
+    _goto(page, url)
     if not is_logged_in(page):
         raise NotLoggedIn(
             "Не залогинены на rutracker (нет признака логина на странице).\n"
-            "Запустите вход: python -m rutracker_grab.fetch --login"
+            "Запустите вход: python -m rutracker_grab --login"
         )
     parts = parse_title(get_raw_title(page))
 
     errors = validate(parts)
     if errors:
-        raise ValidationFailed(
-            "заголовок не прошёл инварианты §11:\n  - " + "\n  - ".join(errors)
-        )
+        raise ParseAmbiguous("заголовок не прошёл инварианты §11: " + "; ".join(errors))
 
     clean = parts.clean_title
     leaf = sanitize_leaf(clean)      # одна строка для обоих потребителей (§2)
@@ -274,31 +279,47 @@ class _LiveDeps:
         recheck_torrent(torrent_hash)
 
 
-def cmd_grab(
-    url: str, *, headed: bool = False, verbose: bool = False, force: bool = False
-) -> int:
-    """`--grab <url>`: реконсиляция раздачи (§10).
+def grab_one(context, page: Page, url: str, *, force: bool = False) -> tuple[_Plan, Report]:
+    """Обработать одну тему в уже открытом контексте (§10).
 
     Каждый артефакт (папка, About.mhtml, folder.jpg, `<leaf>.torrent`, `.grab.json`)
     и наличие раздачи в qBittorrent проверяются независимо; недостающее досоздаётся,
-    существующее не трогается. `skipped` — только когда на месте всё сразу.
-    `--force` перекачивает и перезаписывает всё.
+    существующее не трогается. `force` перекачивает и перезаписывает всё.
+
+    Ничего не печатает — это делает вызывающий (одиночный `--grab` или батч).
     """
     tid = topic_id_from_url(url)
+    plan = _resolve(page, url)
+    try:
+        report = reconcile(
+            target=plan.target,
+            leaf=plan.leaf,
+            clean=plan.clean,
+            qbit_save=plan.qbit_save,
+            topic_id=tid,
+            deps=_LiveDeps(context, page, tid),
+            force=force,
+        )
+    except OSError as exc:  # SMB отвалился, нет прав, длинный путь (§12)
+        raise FsError(f"не удалось записать артефакты в {plan.target}: {exc}") from exc
+    except PlaywrightError as exc:  # снимок, постер, dl.php — всё ходит через браузер
+        raise PageLoadError(
+            f"браузер не справился с темой t={tid}: "
+            f"{type(exc).__name__}: {str(exc).splitlines()[0]}"
+        ) from exc
+    return plan, report
+
+
+def cmd_grab(
+    url: str, *, headed: bool = False, verbose: bool = False, force: bool = False
+) -> int:
+    """`--grab <url>`: реконсиляция одной раздачи с подробным выводом."""
     with sync_playwright() as p:
         context = _launch_context(p, headless=not headed)
         page = context.new_page()
         try:
-            plan = _resolve(page, url)
-            report = reconcile(
-                target=plan.target,
-                leaf=plan.leaf,
-                clean=plan.clean,
-                qbit_save=plan.qbit_save,
-                topic_id=tid,
-                deps=_LiveDeps(context, page, tid),
-                force=force,
-            )
+            with qbit_session():
+                plan, report = grab_one(context, page, url, force=force)
             if verbose:
                 _print_diagnostics(context, page)
         finally:
@@ -315,73 +336,33 @@ def cmd_grab(
     return 0
 
 
-def main(argv: list[str] | None = None) -> int:
-    # Заголовки rutracker — кириллица; консоль Windows может быть не в utf-8.
-    for stream in (sys.stdout, sys.stderr):
-        reconfigure = getattr(stream, "reconfigure", None)
-        if reconfigure is not None:
-            reconfigure(encoding="utf-8")
+def cmd_batch(
+    links_file: str, *, headed: bool = False, verbose: bool = False, force: bool = False
+) -> int:
+    """`<links.txt>`: прогнать список ссылок в одном браузере и одной сессии qBittorrent.
 
-    parser = argparse.ArgumentParser(
-        prog="rutracker_grab.fetch",
-        description="rutracker-grab: логин, проба заголовка и забор раздачи.",
-    )
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--login", action="store_true", help="headed-вход, cookie в профиль")
-    group.add_argument("--probe", metavar="URL", help="headless-чтение заголовка темы")
-    group.add_argument(
-        "--dry-fetch",
-        metavar="URL",
-        help="создать папку, сохранить About.mhtml и folder.jpg (без торрента)",
-    )
-    group.add_argument(
-        "--grab",
-        metavar="URL",
-        help="полный пайплайн: папка + страница + постер + .torrent + закачка на паузе",
-    )
-    parser.add_argument(
-        "--headed",
-        action="store_true",
-        help="для --probe: headless=False, окно держится 20 сек (осмотр глазами)",
-    )
-    parser.add_argument(
-        "--verbose",
-        action="store_true",
-        help="для --probe: печатать блок диагностики (profile/url/title/body/cookies)",
-    )
-    parser.add_argument(
-        "--force",
-        action="store_true",
-        help="для --grab: игнорировать все проверки, перекачать и перезаписать всё (§10)",
-    )
-    args = parser.parse_args(argv)
+    Один persistent-context и одно подключение к qBittorrent на весь батч (§3, п.5):
+    поднимать браузер на каждую ссылку — секунды впустую, да и два процесса на одном
+    профиле не уживаются.
+    """
+    links = read_links(Path(links_file))
+    if not links:
+        print(f"В {links_file} нет ссылок (пустые строки и `#`-комментарии пропускаются).")
+        return 0
 
-    if args.login:
-        return cmd_login()
-    try:
-        if args.dry_fetch:
-            return cmd_dry_fetch(args.dry_fetch, headed=args.headed, verbose=args.verbose)
-        if args.grab:
-            return cmd_grab(
-                args.grab, headed=args.headed, verbose=args.verbose, force=args.force
-            )
-        return cmd_probe(args.probe, headed=args.headed, verbose=args.verbose)
-    except NotLoggedIn as exc:
-        print(f"Ошибка: {exc}", file=sys.stderr)
-        return 2
-    except ValidationFailed as exc:
-        print(f"Ошибка: {exc}", file=sys.stderr)
-        return 3
-    except TorrentNotBittorrent as exc:
-        print(f"Ошибка: {exc}", file=sys.stderr)
-        return 4
-    except QbitAuthError as exc:
-        print(f"Ошибка: {exc}", file=sys.stderr)
-        return 5
-    except QbitRejected as exc:
-        print(f"Ошибка: {exc}", file=sys.stderr)
-        return 6
+    with sync_playwright() as p:
+        context = _launch_context(p, headless=not headed)
+        page = context.new_page()
+        try:
+            with qbit_session():
+                summary = run_batch(
+                    links,
+                    grab=lambda url, *, force=False: grab_one(context, page, url, force=force),
+                    force=force,
+                    verbose=verbose,
+                )
+        finally:
+            context.close()
+    return summary.exit_code()
 
 
-if __name__ == "__main__":
-    raise SystemExit(main())

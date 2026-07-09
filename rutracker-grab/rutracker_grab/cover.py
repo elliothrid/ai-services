@@ -11,8 +11,12 @@ from __future__ import annotations
 import io
 from pathlib import Path
 
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 from playwright.sync_api import BrowserContext, Page
+from playwright.sync_api import Error as PlaywrightError
+
+from . import config
+from .errors import CoverUnavailable
 
 _COVER_SELECTOR = "div.post_body img.postImg.img-right"
 
@@ -37,15 +41,33 @@ def _flatten_to_jpeg(data: bytes, dest: Path) -> Path:
 
 
 def save_cover(page: Page, context: BrowserContext, dest_dir: Path) -> Path | None:
-    """Скачать первый постер `img-right` в `dest_dir/folder.jpg`. None — если постера нет."""
+    """Скачать первый постер `img-right` в `dest_dir/folder.jpg`.
+
+    `None` — постера на странице нет. `CoverUnavailable` — постер есть, но не
+    скачался или не декодировался: раздачу из-за картинки не теряем (§6), тему
+    доводим до конца, следующий прогон постер доберёт.
+    """
     imgs = page.locator(_COVER_SELECTOR)
     if imgs.count() == 0:
         return None
     src = imgs.first.get_attribute("src")
     if not src:
         return None
+
     url = _strip_query(src)
-    resp = context.request.get(url)
+    try:
+        # Постеры лежат на fastpic/imageban: через SOCKS5 дефолтных 30 с не хватает.
+        resp = context.request.get(url, timeout=config.REQUEST_TIMEOUT_MS)
+        body = resp.body()
+    except PlaywrightError as exc:
+        raise CoverUnavailable(
+            f"постер не скачался за {config.REQUEST_TIMEOUT_MS // 1000} с: {url} "
+            f"({type(exc).__name__})"
+        ) from exc
     if not resp.ok:
-        raise RuntimeError(f"постер не скачался: HTTP {resp.status} {url}")
-    return _flatten_to_jpeg(resp.body(), dest_dir / "folder.jpg")
+        raise CoverUnavailable(f"постер не скачался: HTTP {resp.status} {url}")
+
+    try:
+        return _flatten_to_jpeg(body, dest_dir / "folder.jpg")
+    except UnidentifiedImageError as exc:  # битые байты; OSError записи -> FsError выше
+        raise CoverUnavailable(f"постер не декодировался: {url} ({exc})") from exc

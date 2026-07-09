@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 from rutracker_grab import state
+from rutracker_grab.errors import CoverUnavailable
 from rutracker_grab.reconcile import COVER_NAME, MHTML_NAME, reconcile, torrent_name
 from rutracker_grab.torrent import QbitAlreadyPresent, torrent_infohash_v1
 
@@ -27,9 +28,10 @@ INFOHASH = torrent_infohash_v1(TORRENT_BYTES)
 class _FakeDeps:
     def __init__(
         self, *, in_qbit=False, add_exc=None, add_hash=None, has_cover=True,
-        torrent_bytes=TORRENT_BYTES,
+        cover_exc=None, torrent_bytes=TORRENT_BYTES,
     ):
         self._bytes = torrent_bytes
+        self._cover_exc = cover_exc
         self._in_qbit = in_qbit
         self._add_exc = add_exc
         self._add_hash = add_hash
@@ -50,6 +52,8 @@ class _FakeDeps:
 
     def save_cover(self, target: Path) -> Path | None:
         self.calls.append("save_cover")
+        if self._cover_exc is not None:
+            raise self._cover_exc
         if not self._has_cover:
             return None
         dest = target / COVER_NAME
@@ -249,6 +253,27 @@ def test_page_without_poster_reports_missing_cover(target):
     report = _run(target, deps)
 
     assert report.cover == "нет постера на странице"
+    assert not (target / COVER_NAME).exists()
+
+
+def test_cover_failure_does_not_lose_the_torrent(target):
+    """Постер не скачался -> тема доходит до qBittorrent, folder.jpg добёрёт следующий прогон."""
+    deps = _FakeDeps(
+        in_qbit=False,
+        add_hash=INFOHASH,
+        cover_exc=CoverUnavailable("постер не скачался за 60 с: https://fastpic.org/x.png"),
+    )
+
+    report = _run(target, deps)
+
+    assert report.skipped is False
+    assert report.cover.startswith("пропущен (постер не скачался")
+    # Главное: .torrent записан, раздача добавлена, манифест есть.
+    assert (target / torrent_name(LEAF)).exists()
+    assert "add" in deps.calls
+    assert report.qbit == "добавлен на паузе"
+    assert state.read_manifest(target)["torrent_hash"] == INFOHASH
+    # Постера нет -> следующий прогон не скажет skipped и попробует снова.
     assert not (target / COVER_NAME).exists()
 
 

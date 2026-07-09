@@ -11,7 +11,9 @@ from types import SimpleNamespace
 import pytest
 import qbittorrentapi
 
+from rutracker_grab import config
 from rutracker_grab import torrent as torrent_mod
+from rutracker_grab.errors import BadLink
 from rutracker_grab.torrent import (
     QbitAlreadyPresent,
     QbitAuthError,
@@ -19,6 +21,7 @@ from rutracker_grab.torrent import (
     TorrentNotBittorrent,
     add_to_qbit,
     download_torrent,
+    qbit_session,
     recheck_torrent,
     topic_id_from_url,
     torrent_in_qbit,
@@ -41,9 +44,11 @@ class _FakeRequest:
     def __init__(self, response: _FakeResponse):
         self._response = response
         self.last_headers: dict | None = None
+        self.last_timeout: float | None = None
 
-    def get(self, url: str, headers: dict | None = None) -> _FakeResponse:
+    def get(self, url: str, headers: dict | None = None, timeout: float | None = None):
         self.last_headers = headers
+        self.last_timeout = timeout
         return self._response
 
 
@@ -64,7 +69,8 @@ def test_topic_id_from_url(url, expected):
 
 
 def test_topic_id_missing_raises():
-    with pytest.raises(ValueError):
+    # BadLink, а не голый ValueError: батч ловит GrabError и кладёт ссылку в сводку (§12).
+    with pytest.raises(BadLink):
         topic_id_from_url("https://rutracker.org/forum/index.php")
 
 
@@ -74,6 +80,8 @@ def test_accept_by_bencode_first_byte(tmp_path):
     assert dest.read_bytes().startswith(b"d")
     # Referer выставлен на страницу темы (§8).
     assert ctx.request.last_headers["Referer"].endswith("viewtopic.php?t=42")
+    # Таймаут задан явно: дефолтных 30 с Playwright через SOCKS5 не хватает.
+    assert ctx.request.last_timeout == config.REQUEST_TIMEOUT_MS
 
 
 def test_accept_by_content_type(tmp_path):
@@ -242,6 +250,35 @@ def test_torrent_in_qbit(fake_client):
     assert torrent_in_qbit("abc") is True
     fake_client["install"](info_result=[])
     assert torrent_in_qbit("def") is False
+
+
+# --- одно подключение на весь батч (§3, п.5) ---------------------------------
+
+def test_qbit_session_logs_in_once_and_out_at_exit(fake_client, monkeypatch):
+    client = fake_client["install"](info_result=[])
+    logins = []
+    monkeypatch.setattr(client, "auth_log_in", lambda: logins.append(1))
+
+    with qbit_session():
+        torrent_in_qbit("a")
+        torrent_in_qbit("b")
+        torrent_in_qbit("c")
+        assert client.logged_out is False  # сессия ещё жива
+
+    assert logins == [1]  # логин ровно один на три вызова
+    assert client.logged_out is True  # логаут — на выходе из сессии
+
+
+def test_qbit_session_login_is_lazy(fake_client, monkeypatch):
+    """Недоступный qBittorrent не должен ронять батч до разбора первой ссылки."""
+    client = fake_client["install"]()
+    logins = []
+    monkeypatch.setattr(client, "auth_log_in", lambda: logins.append(1))
+
+    with qbit_session():
+        assert logins == []  # вход не состоялся: никто ещё не спросил qBittorrent
+
+    assert client.logged_out is False  # логаутить нечего
 
 
 # --- infohash v1 из bencode ---------------------------------------------------

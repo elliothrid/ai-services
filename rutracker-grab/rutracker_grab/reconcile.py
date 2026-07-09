@@ -28,7 +28,8 @@ from pathlib import Path
 from typing import Protocol
 
 from . import state
-from .torrent import QbitAlreadyPresent, torrent_infohash_v1
+from .errors import CoverUnavailable, QbitAlreadyPresent
+from .torrent import torrent_infohash_v1
 
 MHTML_NAME = "About.mhtml"
 COVER_NAME = "folder.jpg"
@@ -176,10 +177,18 @@ def reconcile(
 
     if before.cover and not force:
         cover_status = _OK
-    elif deps.save_cover(target) is None:
-        cover_status = "нет постера на странице"
     else:
-        cover_status = "перезаписан" if before.cover else "создан"
+        try:
+            saved = deps.save_cover(target)
+        except CoverUnavailable as exc:
+            # Постер — не повод терять раздачу: доводим тему до конца без folder.jpg.
+            # Следующий прогон увидит, что файла нет, и попробует снова (§6).
+            cover_status = f"пропущен ({exc})"
+        else:
+            if saved is None:
+                cover_status = "нет постера на странице"
+            else:
+                cover_status = "перезаписан" if before.cover else "создан"
 
     if from_disk:
         torrent_status = f"ok (с диска, hash={_short(infohash)})"

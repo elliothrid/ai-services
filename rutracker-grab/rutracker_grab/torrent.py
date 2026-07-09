@@ -9,6 +9,10 @@
 - `auth_log_in` не удался        -> `QbitAuthError`  (недоступен / отклонил вход);
 - `torrents_add` вернул 409      -> `QbitAlreadyPresent` (дубль -> skipped, не ошибка);
 - `torrents_add` иначе не удался -> `QbitRejected`.
+Сами классы живут в `errors.py` (§12) — здесь только реэкспорт.
+
+`qbit_session()` держит одно подключение на весь батч; вне сессии каждый вызов
+логинится и разлогинивается сам.
 """
 
 from __future__ import annotations
@@ -22,30 +26,33 @@ import qbittorrentapi
 from playwright.sync_api import BrowserContext
 
 from . import config
+from .errors import (
+    BadLink,
+    QbitAlreadyPresent,
+    QbitAuthError,
+    QbitRejected,
+    TorrentNotBittorrent,
+)
+
+__all__ = [
+    "QbitAlreadyPresent",
+    "QbitAuthError",
+    "QbitRejected",
+    "TorrentNotBittorrent",
+    "add_to_qbit",
+    "check_add_result",
+    "download_torrent",
+    "fetch_torrent_bytes",
+    "qbit_session",
+    "recheck_torrent",
+    "topic_id_from_url",
+    "torrent_in_qbit",
+    "torrent_infohash_v1",
+]
 
 _DL_URL = "https://rutracker.org/forum/dl.php?t={tid}"
 _TOPIC_URL = "https://rutracker.org/forum/viewtopic.php?t={tid}"
 _TID_RE = re.compile(r"[?&]t=(\d+)")
-
-
-class TorrentNotBittorrent(RuntimeError):
-    """dl.php вернул не торрент — обычно истёкшая сессия (-> `--login`), §12."""
-
-
-class QbitAuthError(RuntimeError):
-    """qBittorrent недоступен или отклонил вход (auth_log_in), §12."""
-
-
-class QbitRejected(RuntimeError):
-    """qBittorrent реально отклонил добавление раздачи, §12."""
-
-
-class QbitAlreadyPresent(RuntimeError):
-    """Раздача уже в qBittorrent (409 / дубль по хешу) — это skipped, не ошибка (§10)."""
-
-    def __init__(self, message: str, torrent_hash: str | None = None):
-        super().__init__(message)
-        self.torrent_hash = torrent_hash
 
 
 # --- dl.php -----------------------------------------------------------------
@@ -54,7 +61,7 @@ def topic_id_from_url(url: str) -> str:
     """Вынуть `<id>` из `...viewtopic.php?t=<id>`."""
     m = _TID_RE.search(url)
     if not m:
-        raise ValueError(f"не найден topic id (t=<...>) в url: {url!r}")
+        raise BadLink(f"не найден topic id (t=<...>) в url: {url!r}")
     return m.group(1)
 
 
@@ -63,6 +70,7 @@ def fetch_torrent_bytes(context: BrowserContext, topic_id: str) -> bytes:
     resp = context.request.get(
         _DL_URL.format(tid=topic_id),
         headers={"Referer": _TOPIC_URL.format(tid=topic_id)},
+        timeout=config.REQUEST_TIMEOUT_MS,
     )
     body = resp.body()
     ctype = resp.headers.get("content-type", "").lower()
@@ -71,7 +79,7 @@ def fetch_torrent_bytes(context: BrowserContext, topic_id: str) -> bytes:
         raise TorrentNotBittorrent(
             f"dl.php вернул не торрент (HTTP {resp.status}, content-type {ctype!r}) — "
             "вероятно, сессия истекла.\n"
-            "Запустите вход заново: python -m rutracker_grab.fetch --login"
+            "Запустите вход заново: python -m rutracker_grab --login"
         )
     return body
 
@@ -127,9 +135,8 @@ def _bdecode(data: bytes, i: int) -> tuple[object, int]:
 
 # --- qBittorrent (напрямую по LAN, §6a) -------------------------------------
 
-@contextmanager
-def _logged_in_client():
-    """Клиент qBittorrent с явным логином. Сбой входа -> QbitAuthError (не путать с add)."""
+def _connect():
+    """Новый клиент с явным логином. Сбой входа -> QbitAuthError (не путать с add)."""
     client = qbittorrentapi.Client(
         host=config.QBIT_WEBUI,
         username=config.QBIT_USER,
@@ -139,13 +146,57 @@ def _logged_in_client():
         client.auth_log_in()
     except qbittorrentapi.exceptions.APIError as exc:
         raise QbitAuthError(f"qBittorrent недоступен или отклонил вход: {exc}") from exc
+    return client
+
+
+def _log_out(client) -> None:
+    try:
+        client.auth_log_out()
+    except Exception:  # noqa: BLE001 — logout best-effort
+        pass
+
+
+# Активная сессия батча: {"client": <клиент или None>}. None — сессии нет,
+# каждый вызов логинится сам (одиночный --grab, тесты).
+_session: dict | None = None
+
+
+@contextmanager
+def qbit_session():
+    """Одно подключение к qBittorrent на весь батч (§3, п.5).
+
+    Логин ленивый: клиент создаётся при первом обращении, а не на входе. Иначе
+    недоступный qBittorrent ронял бы весь батч ещё до разбора первой ссылки —
+    а по §12 это ошибка одной темы, не всего прогона. Вложенный вызов — no-op.
+    """
+    global _session
+    if _session is not None:
+        yield
+        return
+    _session = {"client": None}
+    try:
+        yield
+    finally:
+        client = _session["client"]
+        _session = None
+        if client is not None:
+            _log_out(client)
+
+
+@contextmanager
+def _logged_in_client():
+    """Клиент qBittorrent: из сессии батча, иначе одноразовый (с логаутом)."""
+    if _session is not None:
+        if _session["client"] is None:
+            _session["client"] = _connect()  # логаут — на выходе из qbit_session
+        yield _session["client"]
+        return
+
+    client = _connect()
     try:
         yield client
     finally:
-        try:
-            client.auth_log_out()
-        except Exception:  # noqa: BLE001 — logout best-effort
-            pass
+        _log_out(client)
 
 
 def torrent_in_qbit(torrent_hash: str) -> bool:

@@ -32,3 +32,11 @@ SOCKS5_PROXY = f"socks5://127.0.0.1:{SOCKS5_PORT}"
 
 # Персистентный профиль Chromium (cookie логина живут здесь между запусками).
 BROWSER_PROFILE_DIR = Path.home() / ".rutracker_grab_profile"
+
+# Таймаут открытия страницы: через SOCKS5 рутрекер бывает медленным, дефолтных
+# 30 с не хватает. Превышение -> PageLoadError, батч едет дальше (§12).
+PAGE_TIMEOUT_MS = 60_000
+
+# Таймаут `context.request.get` (dl.php и постер). Дефолт Playwright — те же 30 с,
+# но постеры лежат на fastpic/imageban и через SOCKS5 отвечают медленно.
+REQUEST_TIMEOUT_MS = 60_000
