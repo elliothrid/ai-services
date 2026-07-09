@@ -7,10 +7,10 @@ name = "rutracker-grab"
 version = "0.1.0"
 description = "Забирает раздачи с rutracker.org: чистит заголовок, раскладывает по папкам NAS, сохраняет страницу и постер, заводит закачку в qBittorrent."
 requires-python = ">=3.12"
-# Итерация 2a — добавлен Playwright (браузер, логин, чтение темы).
-# Остальные зависимости (qbittorrent-api, Pillow, questionary/rich,
-# claude-agent-sdk) подключаются в следующих итерациях.
-dependencies = ["playwright"]
+# Итерация 2a — Playwright; 2b — Pillow (постер -> folder.jpg).
+# Остальные зависимости (qbittorrent-api, questionary/rich, claude-agent-sdk)
+# подключаются в следующих итерациях.
+dependencies = ["playwright", "Pillow"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]

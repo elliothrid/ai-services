@@ -16,7 +16,11 @@ import sys
 from playwright.sync_api import Page, sync_playwright
 
 from . import config
+from .cover import save_cover
+from .env_adapter import local_dir, qbit_save_path, sanitize_leaf
+from .page_saver import save_page_mhtml
 from .title.parse import parse_title
+from .title.validate import validate
 
 LOGIN_URL = "https://rutracker.org/forum/login.php"
 
@@ -29,6 +33,10 @@ _TITLE_SELECTOR = "h1.maintitle"
 
 class NotLoggedIn(RuntimeError):
     """Сессия не залогинена — нужен `--login` (DESIGN.md §12)."""
+
+
+class ValidationFailed(RuntimeError):
+    """Заголовок не прошёл инварианты §11 — на диск не пишем (уходило бы в интерактив)."""
 
 
 # --- Проверки страницы ------------------------------------------------------
@@ -155,6 +163,55 @@ def cmd_probe(url: str, *, headed: bool = False, verbose: bool = False) -> int:
     return 0
 
 
+def cmd_dry_fetch(url: str, *, headed: bool = False, verbose: bool = False) -> int:
+    """`--dry-fetch <url>`: создать папку, сохранить `<leaf>.mhtml` и `folder.jpg`.
+
+    Торрент НЕ качаем, qBittorrent не трогаем. Перед записью прогоняем инварианты
+    §11 — при нарушении на диск ничего не пишем (это ушло бы в интерактив).
+    """
+    with sync_playwright() as p:
+        context = _launch_context(p, headless=not headed)
+        page = context.new_page()
+        cover: Path | None = None
+        try:
+            page.goto(url, wait_until="load")
+            if not is_logged_in(page):
+                raise NotLoggedIn(
+                    "Не залогинены на rutracker (нет признака логина на странице).\n"
+                    "Запустите вход: python -m rutracker_grab.fetch --login"
+                )
+            raw = get_raw_title(page)
+            parts = parse_title(raw)
+
+            errors = validate(parts)
+            if errors:
+                raise ValidationFailed(
+                    "заголовок не прошёл инварианты §11:\n  - " + "\n  - ".join(errors)
+                )
+
+            clean = parts.clean_title
+            leaf = sanitize_leaf(clean)      # одна строка для обоих потребителей (§2)
+            target = local_dir(leaf)
+            qbit = qbit_save_path(leaf)
+
+            target.mkdir(parents=True, exist_ok=True)
+            mhtml = save_page_mhtml(page, target / "About.mhtml")
+            cover = save_cover(page, context, target)
+
+            if verbose:
+                _print_diagnostics(context, page)
+        finally:
+            context.close()
+
+    print(f"clean:     {clean}")
+    print(f"leaf:      {leaf}")
+    print(f"local_dir: {target}")
+    print(f"qbit_save: {qbit}")
+    print(f"mhtml:     {mhtml.name}")
+    print(f"cover:     {cover.name if cover else '<не найден postImg.img-right>'}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     # Заголовки rutracker — кириллица; консоль Windows может быть не в utf-8.
     for stream in (sys.stdout, sys.stderr):
@@ -169,6 +226,11 @@ def main(argv: list[str] | None = None) -> int:
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--login", action="store_true", help="headed-вход, cookie в профиль")
     group.add_argument("--probe", metavar="URL", help="headless-чтение заголовка темы")
+    group.add_argument(
+        "--dry-fetch",
+        metavar="URL",
+        help="создать папку, сохранить <leaf>.mhtml и folder.jpg (без торрента)",
+    )
     parser.add_argument(
         "--headed",
         action="store_true",
@@ -184,10 +246,15 @@ def main(argv: list[str] | None = None) -> int:
     if args.login:
         return cmd_login()
     try:
+        if args.dry_fetch:
+            return cmd_dry_fetch(args.dry_fetch, headed=args.headed, verbose=args.verbose)
         return cmd_probe(args.probe, headed=args.headed, verbose=args.verbose)
     except NotLoggedIn as exc:
         print(f"Ошибка: {exc}", file=sys.stderr)
         return 2
+    except ValidationFailed as exc:
+        print(f"Ошибка: {exc}", file=sys.stderr)
+        return 3
 
 
 if __name__ == "__main__":
