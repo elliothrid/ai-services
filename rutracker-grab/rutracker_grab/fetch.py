@@ -13,25 +13,26 @@ from __future__ import annotations
 import argparse
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 
 from playwright.sync_api import Page, sync_playwright
 
-from . import config, state
+from . import config
 from .cover import save_cover
 from .env_adapter import local_dir, qbit_save_path, sanitize_leaf
 from .page_saver import save_page_mhtml
+from .reconcile import MHTML_NAME, reconcile
 from .title.parse import parse_title
 from .title.validate import validate
 from .torrent import (
-    QbitAlreadyPresent,
     QbitAuthError,
     QbitRejected,
     TorrentNotBittorrent,
     add_to_qbit,
     fetch_torrent_bytes,
+    recheck_torrent,
     topic_id_from_url,
     torrent_in_qbit,
-    torrent_infohash_v1,
 )
 
 LOGIN_URL = "https://rutracker.org/forum/login.php"
@@ -210,9 +211,9 @@ def _resolve(page: Page, url: str) -> _Plan:
 
 
 def _write_artifacts(page: Page, context, target: Path) -> tuple[Path, Path | None]:
-    """Создать папку и сохранить `About.mhtml` + `folder.jpg`."""
+    """Создать папку и сохранить `About.mhtml` + `folder.jpg` (для `--dry-fetch`)."""
     target.mkdir(parents=True, exist_ok=True)
-    mhtml = save_page_mhtml(page, target / "About.mhtml")
+    mhtml = save_page_mhtml(page, target / MHTML_NAME)
     cover = save_cover(page, context, target)
     return mhtml, cover
 
@@ -242,72 +243,75 @@ def cmd_dry_fetch(url: str, *, headed: bool = False, verbose: bool = False) -> i
     return 0
 
 
+class _LiveDeps:
+    """Побочные эффекты `reconcile` на живых браузере и qBittorrent (§10).
+
+    qBittorrent дёргаем прямо по LAN, минуя SOCKS5 (§6a), — контекст браузера при
+    этом может быть открыт, они не мешают друг другу.
+    """
+
+    def __init__(self, context, page: Page, topic_id: str):
+        self._context = context
+        self._page = page
+        self._topic_id = topic_id
+
+    def fetch_torrent(self) -> bytes:
+        return fetch_torrent_bytes(self._context, self._topic_id)
+
+    def save_page(self, target: Path) -> Path:
+        return save_page_mhtml(self._page, target / MHTML_NAME)
+
+    def save_cover(self, target: Path) -> Path | None:
+        return save_cover(self._page, self._context, target)
+
+    def in_qbit(self, infohash: str) -> bool:
+        return torrent_in_qbit(infohash)
+
+    def add(self, torrent_path: Path, save_path: str, rename: str) -> str | None:
+        return add_to_qbit(torrent_path, save_path, rename)
+
+    def recheck(self, torrent_hash: str) -> None:
+        recheck_torrent(torrent_hash)
+
+
 def cmd_grab(
     url: str, *, headed: bool = False, verbose: bool = False, force: bool = False
 ) -> int:
-    """`--grab <url>`: полный пайплайн с идемпотентностью (§10).
+    """`--grab <url>`: реконсиляция раздачи (§10).
 
-    Папка -> About.mhtml -> folder.jpg -> `<leaf>.torrent` -> закачка на паузе.
-    Пропускает работу (skipped, exit 0), если тема уже забрана: по манифесту
-    `.grab.json` или по наличию хеша в qBittorrent. `--force` игнорирует манифест.
+    Каждый артефакт (папка, About.mhtml, folder.jpg, `<leaf>.torrent`, `.grab.json`)
+    и наличие раздачи в qBittorrent проверяются независимо; недостающее досоздаётся,
+    существующее не трогается. `skipped` — только когда на месте всё сразу.
+    `--force` перекачивает и перезаписывает всё.
     """
     tid = topic_id_from_url(url)
-    mhtml: Path | None = None
-    cover: Path | None = None
     with sync_playwright() as p:
         context = _launch_context(p, headless=not headed)
         page = context.new_page()
         try:
             plan = _resolve(page, url)
-
-            # 1) Идемпотентность по манифесту (только exists(), без glob — §10).
-            if state.should_skip(plan.target, tid, force=force):
-                print(f"skipped: тема уже забрана (манифест {state.MANIFEST_NAME} в {plan.target})")
-                return 0
-
-            # 2) Скачать .torrent во временный буфер и посчитать infohash до записи.
-            data = fetch_torrent_bytes(context, tid)
-            infohash = torrent_infohash_v1(data)
-
-            # 3) Дубль в qBittorrent? Тогда артефакты не перезаписываем (§10).
-            if torrent_in_qbit(infohash):
-                print(f"skipped: раздача уже в qBittorrent (hash={infohash})")
-                return 0
-
-            # 4) Не дубль — пишем артефакты и .torrent.
-            mhtml, cover = _write_artifacts(page, context, plan.target)
-            torrent = plan.target / f"{plan.leaf}.torrent"
-            torrent.write_bytes(data)
+            report = reconcile(
+                target=plan.target,
+                leaf=plan.leaf,
+                clean=plan.clean,
+                qbit_save=plan.qbit_save,
+                topic_id=tid,
+                deps=_LiveDeps(context, page, tid),
+                force=force,
+            )
             if verbose:
                 _print_diagnostics(context, page)
         finally:
             context.close()
 
-    # 5) Добавить в qBittorrent (напрямую по LAN, без прокси — §6a).
-    try:
-        torrent_hash = add_to_qbit(torrent, plan.qbit_save, plan.clean)
-    except QbitAlreadyPresent as exc:
-        # Гонка: между дубль-чеком и add раздачу успели добавить — это skipped.
-        print(f"skipped: {exc}")
-        return 0
-
-    # 6) Манифест — после успешного добавления (§10).
-    state.write_manifest(
-        plan.target,
-        topic_id=tid,
-        clean_title=plan.clean,
-        torrent_hash=torrent_hash or infohash,
-    )
-
+    if report.skipped:
+        print(f"skipped: всё на месте, раздача в qBittorrent ({plan.target})")
     print(f"clean:     {plan.clean}")
     print(f"leaf:      {plan.leaf}")
     print(f"local_dir: {plan.target}")
     print(f"qbit_save: {plan.qbit_save}")
-    print(f"mhtml:     {mhtml.name}")
-    print(f"cover:     {cover.name if cover else '<не найден postImg.img-right>'}")
-    print(f"torrent:   {torrent.name}")
-    print(f"qbit:      добавлено на паузе (hash={torrent_hash or infohash})")
-    print(f"manifest:  {state.MANIFEST_NAME}")
+    for line in report.lines():
+        print(line)
     return 0
 
 
@@ -320,7 +324,7 @@ def main(argv: list[str] | None = None) -> int:
 
     parser = argparse.ArgumentParser(
         prog="rutracker_grab.fetch",
-        description="Итерация 2a: логин и проба чтения темы через браузер.",
+        description="rutracker-grab: логин, проба заголовка и забор раздачи.",
     )
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--login", action="store_true", help="headed-вход, cookie в профиль")
@@ -348,7 +352,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--force",
         action="store_true",
-        help="для --grab: игнорировать манифест .grab.json и перезаписать (§10)",
+        help="для --grab: игнорировать все проверки, перекачать и перезаписать всё (§10)",
     )
     args = parser.parse_args(argv)
 

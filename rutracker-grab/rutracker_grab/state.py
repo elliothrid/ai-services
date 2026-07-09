@@ -1,8 +1,9 @@
 """Манифесты и идемпотентность (DESIGN.md §10).
 
-В каждой папке раздачи — `.grab.json` (topic_id, clean_title, torrent_hash, added_at,
-версия правил). Перед повторным прогоном: если манифест есть и topic_id совпал —
-`skipped` (если не форсим `--force`).
+В каждой папке раздачи — `.grab.json` (topic_id, clean_title, torrent_hash,
+first_grabbed_at, updated_at, версия правил). Модуль только читает и пишет манифест;
+решение «пропустить прогон» принимается в `reconcile.py` по совокупности артефактов,
+а не по одному манифесту.
 
 ВАЖНО: имя папки (leaf) содержит `[...]` — НЕ искать через glob/Path.glob(), скобки
 станут классом символов и поиск молча вернёт пусто. Только `Path.exists()`.
@@ -40,16 +41,28 @@ def write_manifest(
     topic_id: str,
     clean_title: str,
     torrent_hash: str | None,
-    added_at: str | None = None,
+    now: str | None = None,
     rules_version: int = config.RULES_VERSION,
 ) -> Path:
-    """Записать `.grab.json` после успешного прогона. Возвращает путь манифеста."""
+    """Перезаписать `.grab.json` после успешного прогона. Возвращает путь манифеста.
+
+    Пишем всегда (кроме `skipped`): раздача на рутрекере могла обновиться, и тогда
+    `torrent_hash` в старом манифесте протух. `first_grabbed_at` переносим из
+    прежнего манифеста (у самых старых это поле называлось `added_at`), `updated_at`
+    ставим текущий. Если манифеста не было — оба равны времени этого прогона.
+    """
     path = manifest_path(folder)
+    updated_at = now or datetime.now(timezone.utc).isoformat()
+
+    previous = read_manifest(folder) or {}
+    first_grabbed_at = previous.get("first_grabbed_at") or previous.get("added_at") or updated_at
+
     data = {
         "topic_id": str(topic_id),
         "clean_title": clean_title,
         "torrent_hash": torrent_hash,
-        "added_at": added_at or datetime.now(timezone.utc).isoformat(),
+        "first_grabbed_at": first_grabbed_at,
+        "updated_at": updated_at,
         "rules_version": rules_version,
     }
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -57,11 +70,10 @@ def write_manifest(
 
 
 def is_already_grabbed(folder: Path, topic_id: str) -> bool:
-    """Есть манифест и его `topic_id` совпадает с текущим."""
+    """Есть манифест и его `topic_id` совпадает с текущим.
+
+    Наличия манифеста НЕ достаточно, чтобы пропустить прогон: артефакты могли
+    удалить по отдельности. Решение о `skipped` принимает `reconcile.py` (§10).
+    """
     manifest = read_manifest(folder)
     return bool(manifest) and str(manifest.get("topic_id")) == str(topic_id)
-
-
-def should_skip(folder: Path, topic_id: str, *, force: bool) -> bool:
-    """Пропустить прогон: манифест уже есть для этого topic_id и не форсим."""
-    return not force and is_already_grabbed(folder, topic_id)

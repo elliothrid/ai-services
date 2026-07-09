@@ -19,6 +19,7 @@ from rutracker_grab.torrent import (
     TorrentNotBittorrent,
     add_to_qbit,
     download_torrent,
+    recheck_torrent,
     topic_id_from_url,
     torrent_in_qbit,
     torrent_infohash_v1,
@@ -101,6 +102,7 @@ class _FakeClient:
         self._info_result = info_result if info_result is not None else []
         self.add_kwargs: dict | None = None
         self.info_hashes: str | None = None
+        self.recheck_hashes: str | None = None
         self.logged_out = False
 
     def auth_log_in(self):
@@ -119,6 +121,9 @@ class _FakeClient:
     def torrents_info(self, torrent_hashes=None):
         self.info_hashes = torrent_hashes
         return self._info_result
+
+    def torrents_recheck(self, torrent_hashes=None):
+        self.recheck_hashes = torrent_hashes
 
 
 @pytest.fixture
@@ -223,6 +228,13 @@ def test_add_generic_api_error_is_rejected(tmp_path, fake_client):
     )
     with pytest.raises(QbitRejected):
         add_to_qbit(tor, "/torrents-active/leaf", "Имя")
+
+
+def test_recheck_torrent(fake_client):
+    client = fake_client["install"]()
+    recheck_torrent("8d36abc")
+    assert client.recheck_hashes == "8d36abc"
+    assert client.logged_out is True
 
 
 def test_torrent_in_qbit(fake_client):

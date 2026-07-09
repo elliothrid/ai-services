@@ -155,6 +155,19 @@ def torrent_in_qbit(torrent_hash: str) -> bool:
     return len(found) > 0
 
 
+def recheck_torrent(torrent_hash: str) -> None:
+    """Force recheck: qBittorrent сверит уже лежащие на диске файлы (§10).
+
+    Нужен после добавления раздачи в существующую папку — иначе qBittorrent считает
+    контент отсутствующим и качает его заново поверх готового.
+    """
+    with _logged_in_client() as client:
+        try:
+            client.torrents_recheck(torrent_hashes=torrent_hash)
+        except qbittorrentapi.exceptions.APIError as exc:
+            raise QbitRejected(f"qBittorrent отклонил recheck: {exc}") from exc
+
+
 def _field(obj: object, name: str, default: int = 0) -> object:
     """Достать поле из ответа qbittorrent-api (dict или AttrDict-объект)."""
     if isinstance(obj, dict):
