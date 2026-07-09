@@ -1,7 +1,7 @@
-"""Playwright persistent-context, логин, рендер страницы (DESIGN.md §3, §6a, §8).
+"""Playwright persistent-context, логин, рендер и полный пайплайн (DESIGN.md §3, §6a, §8).
 
-Итерация 2a — только чтение страницы через браузер. Ничего не пишем на диск,
-`dl.php` и qBittorrent не трогаем.
+CLI: `--login` (headed-вход), `--probe` (чтение заголовка), `--dry-fetch` (папка +
+страница + постер, без торрента), `--grab` (полный пайплайн до закачки в qBittorrent).
 
 Сеть: Chromium ходит через локальный SOCKS5 (Happ), персистентный профиль хранит
 cookie логина между запусками (§6a). Сайт отдаёт `charset=windows-1251`, но браузер
@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from dataclasses import dataclass
 
 from playwright.sync_api import Page, sync_playwright
 
@@ -21,6 +22,13 @@ from .env_adapter import local_dir, qbit_save_path, sanitize_leaf
 from .page_saver import save_page_mhtml
 from .title.parse import parse_title
 from .title.validate import validate
+from .torrent import (
+    QbitRejected,
+    TorrentNotBittorrent,
+    add_to_qbit,
+    download_torrent,
+    topic_id_from_url,
+)
 
 LOGIN_URL = "https://rutracker.org/forum/login.php"
 
@@ -163,52 +171,99 @@ def cmd_probe(url: str, *, headed: bool = False, verbose: bool = False) -> int:
     return 0
 
 
-def cmd_dry_fetch(url: str, *, headed: bool = False, verbose: bool = False) -> int:
-    """`--dry-fetch <url>`: создать папку, сохранить `<leaf>.mhtml` и `folder.jpg`.
+@dataclass
+class _Artifacts:
+    """Результат общей части пайплайна (папка + страница + постер)."""
 
-    Торрент НЕ качаем, qBittorrent не трогаем. Перед записью прогоняем инварианты
-    §11 — при нарушении на диск ничего не пишем (это ушло бы в интерактив).
+    clean: str
+    leaf: str
+    target: Path
+    qbit_save: str
+    mhtml: Path
+    cover: Path | None
+
+
+def _save_artifacts(page: Page, context, url: str) -> _Artifacts:
+    """Общий шаг --dry-fetch/--grab: логин-чек -> parse -> §11 -> папка + mhtml + cover.
+
+    Открывает тему, валидирует заголовок и пишет папку/страницу/постер. Торрент и
+    qBittorrent сюда не входят.
+    """
+    page.goto(url, wait_until="load")
+    if not is_logged_in(page):
+        raise NotLoggedIn(
+            "Не залогинены на rutracker (нет признака логина на странице).\n"
+            "Запустите вход: python -m rutracker_grab.fetch --login"
+        )
+    parts = parse_title(get_raw_title(page))
+
+    errors = validate(parts)
+    if errors:
+        raise ValidationFailed(
+            "заголовок не прошёл инварианты §11:\n  - " + "\n  - ".join(errors)
+        )
+
+    clean = parts.clean_title
+    leaf = sanitize_leaf(clean)      # одна строка для обоих потребителей (§2)
+    target = local_dir(leaf)
+
+    target.mkdir(parents=True, exist_ok=True)
+    mhtml = save_page_mhtml(page, target / "About.mhtml")
+    cover = save_cover(page, context, target)
+    return _Artifacts(clean, leaf, target, qbit_save_path(leaf), mhtml, cover)
+
+
+def cmd_dry_fetch(url: str, *, headed: bool = False, verbose: bool = False) -> int:
+    """`--dry-fetch <url>`: создать папку, сохранить `About.mhtml` и `folder.jpg`.
+
+    Торрент НЕ качаем, qBittorrent не трогаем.
     """
     with sync_playwright() as p:
         context = _launch_context(p, headless=not headed)
         page = context.new_page()
-        cover: Path | None = None
         try:
-            page.goto(url, wait_until="load")
-            if not is_logged_in(page):
-                raise NotLoggedIn(
-                    "Не залогинены на rutracker (нет признака логина на странице).\n"
-                    "Запустите вход: python -m rutracker_grab.fetch --login"
-                )
-            raw = get_raw_title(page)
-            parts = parse_title(raw)
-
-            errors = validate(parts)
-            if errors:
-                raise ValidationFailed(
-                    "заголовок не прошёл инварианты §11:\n  - " + "\n  - ".join(errors)
-                )
-
-            clean = parts.clean_title
-            leaf = sanitize_leaf(clean)      # одна строка для обоих потребителей (§2)
-            target = local_dir(leaf)
-            qbit = qbit_save_path(leaf)
-
-            target.mkdir(parents=True, exist_ok=True)
-            mhtml = save_page_mhtml(page, target / "About.mhtml")
-            cover = save_cover(page, context, target)
-
+            art = _save_artifacts(page, context, url)
             if verbose:
                 _print_diagnostics(context, page)
         finally:
             context.close()
 
-    print(f"clean:     {clean}")
-    print(f"leaf:      {leaf}")
-    print(f"local_dir: {target}")
-    print(f"qbit_save: {qbit}")
-    print(f"mhtml:     {mhtml.name}")
-    print(f"cover:     {cover.name if cover else '<не найден postImg.img-right>'}")
+    print(f"clean:     {art.clean}")
+    print(f"leaf:      {art.leaf}")
+    print(f"local_dir: {art.target}")
+    print(f"qbit_save: {art.qbit_save}")
+    print(f"mhtml:     {art.mhtml.name}")
+    print(f"cover:     {art.cover.name if art.cover else '<не найден postImg.img-right>'}")
+    return 0
+
+
+def cmd_grab(url: str, *, headed: bool = False, verbose: bool = False) -> int:
+    """`--grab <url>`: полный пайплайн — папка -> About.mhtml -> folder.jpg ->
+    `<leaf>.torrent` -> закачка в qBittorrent на паузе."""
+    tid = topic_id_from_url(url)
+    with sync_playwright() as p:
+        context = _launch_context(p, headless=not headed)
+        page = context.new_page()
+        try:
+            art = _save_artifacts(page, context, url)
+            # Торрент — тем же контекстом (те же cookie/прокси), с Referer (§8).
+            torrent = download_torrent(context, tid, art.target / f"{art.leaf}.torrent")
+            if verbose:
+                _print_diagnostics(context, page)
+        finally:
+            context.close()
+
+    # qBittorrent — напрямую по LAN, без SOCKS5-прокси (§6a).
+    torrent_hash = add_to_qbit(torrent, art.qbit_save, art.clean)
+
+    print(f"clean:     {art.clean}")
+    print(f"leaf:      {art.leaf}")
+    print(f"local_dir: {art.target}")
+    print(f"qbit_save: {art.qbit_save}")
+    print(f"mhtml:     {art.mhtml.name}")
+    print(f"cover:     {art.cover.name if art.cover else '<не найден postImg.img-right>'}")
+    print(f"torrent:   {torrent.name}")
+    print(f"qbit:      добавлено на паузе (hash={torrent_hash or 'n/a'})")
     return 0
 
 
@@ -229,7 +284,12 @@ def main(argv: list[str] | None = None) -> int:
     group.add_argument(
         "--dry-fetch",
         metavar="URL",
-        help="создать папку, сохранить <leaf>.mhtml и folder.jpg (без торрента)",
+        help="создать папку, сохранить About.mhtml и folder.jpg (без торрента)",
+    )
+    group.add_argument(
+        "--grab",
+        metavar="URL",
+        help="полный пайплайн: папка + страница + постер + .torrent + закачка на паузе",
     )
     parser.add_argument(
         "--headed",
@@ -248,6 +308,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.dry_fetch:
             return cmd_dry_fetch(args.dry_fetch, headed=args.headed, verbose=args.verbose)
+        if args.grab:
+            return cmd_grab(args.grab, headed=args.headed, verbose=args.verbose)
         return cmd_probe(args.probe, headed=args.headed, verbose=args.verbose)
     except NotLoggedIn as exc:
         print(f"Ошибка: {exc}", file=sys.stderr)
@@ -255,6 +317,12 @@ def main(argv: list[str] | None = None) -> int:
     except ValidationFailed as exc:
         print(f"Ошибка: {exc}", file=sys.stderr)
         return 3
+    except TorrentNotBittorrent as exc:
+        print(f"Ошибка: {exc}", file=sys.stderr)
+        return 4
+    except QbitRejected as exc:
+        print(f"Ошибка: {exc}", file=sys.stderr)
+        return 5
 
 
 if __name__ == "__main__":
