@@ -5,3 +5,4 @@ rules.local.json
 __pycache__/
 .pytest_cache/
 links.txt
+links_test.txt

@@ -78,6 +78,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="спрашивать при неоднозначности: подтвердить/поправить имя, "
         "классифицировать скобки, выбрать постер. Ответы копятся в rules.local.json (§9)",
     )
+    parser.add_argument(
+        "--review-all",
+        action="store_true",
+        help="для батча: сперва разобрать все ссылки и показать план, выполнять "
+        "только после подтверждения (§9)",
+    )
     return parser
 
 
@@ -97,9 +103,12 @@ def main(argv: list[str] | None = None) -> int:
                      "--login | --probe | --dry-fetch | --grab")
     if args.links_file and any(commands[1:]):
         parser.error("файл со ссылками нельзя совмещать с --login/--probe/--dry-fetch/--grab")
-    if args.interactive and not sys.stdin.isatty():
+    if args.review_all and not args.links_file:
+        parser.error("--review-all имеет смысл только для батча (файл со ссылками)")
+    if (args.interactive or args.review_all) and not sys.stdin.isatty():
         # Иначе прогон из планировщика/пайпа молча повиснет на первом же вопросе.
-        parser.error("--interactive требует терминал: stdin не является TTY")
+        flag = "--interactive" if args.interactive else "--review-all"
+        parser.error(f"{flag} требует терминал: stdin не является TTY")
 
     if args.login:
         return cmd_login()
@@ -111,6 +120,7 @@ def main(argv: list[str] | None = None) -> int:
                 verbose=args.verbose,
                 force=args.force,
                 interactive=args.interactive,
+                review_all=args.review_all,
             )
         if args.dry_fetch:
             return cmd_dry_fetch(args.dry_fetch, headed=args.headed, verbose=args.verbose)

@@ -9,7 +9,14 @@ from types import SimpleNamespace
 
 import pytest
 
-from rutracker_grab.batch import ERROR, OK, SKIPPED, read_links, run_batch
+from rutracker_grab.batch import (
+    ERROR,
+    OK,
+    SKIPPED,
+    read_links,
+    run_batch,
+    run_review_batch,
+)
 from rutracker_grab.errors import (
     FsError,
     NotLoggedIn,
@@ -238,3 +245,157 @@ def test_force_is_passed_to_every_link():
     run_batch([T1, T2], grab=grab, force=True, out=lambda _: None)
 
     assert grab.forces == [True, True]
+
+
+# --- --review-all: сперва план, потом выполнение (§9) -------------------------
+
+class _FakeTwoPhase:
+    """`resolve(url)` и `execute(url, plan)`; каждый шаг можно заставить упасть."""
+
+    def __init__(self, resolved: dict, executed: dict | None = None):
+        self._resolved = resolved
+        self._executed = executed or {}
+        self.resolved: list[str] = []
+        self.executed: list[str] = []
+        self.forces: list[bool] = []
+
+    def resolve(self, url: str):
+        self.resolved.append(url)
+        outcome = self._resolved[url]
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    def execute(self, url: str, plan, *, force: bool = False):
+        self.executed.append(url)
+        self.forces.append(force)
+        outcome = self._executed.get(url, _report())
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+
+def _yes(_planned):
+    return True
+
+
+def _no(_planned):
+    return False
+
+
+def test_review_all_shows_plan_then_executes():
+    fake = _FakeTwoPhase({T1: _plan("Первая [2026]"), T2: _plan("Вторая [2020]")})
+    lines: list[str] = []
+    seen: list[int] = []
+
+    def confirm(planned):
+        seen.append(len(planned))
+        # На момент подтверждения не выполнено ничего — в этом весь смысл (§9).
+        assert fake.executed == []
+        return True
+
+    summary = run_review_batch(
+        [T1, T2], resolve=fake.resolve, execute=fake.execute, confirm=confirm, out=lines.append
+    )
+
+    assert seen == [2]
+    assert fake.resolved == [T1, T2]
+    assert fake.executed == [T1, T2]
+    assert summary.counts[OK] == 2
+    assert summary.exit_code() == 0
+    assert any("план" in line for line in lines)
+
+
+def test_review_all_declined_executes_nothing():
+    fake = _FakeTwoPhase({T1: _plan(), T2: _plan()})
+    lines: list[str] = []
+
+    summary = run_review_batch(
+        [T1, T2], resolve=fake.resolve, execute=fake.execute, confirm=_no, out=lines.append
+    )
+
+    assert fake.executed == []
+    assert summary.cancelled is True
+    assert summary.exit_code() == 0  # отказ от плана — не ошибка
+    assert any("не подтверждён" in line for line in lines)
+
+
+def test_review_all_keeps_broken_link_out_of_the_plan():
+    fake = _FakeTwoPhase({
+        T1: _plan("Первая [2026]"),
+        T2: ParseAmbiguous("незнакомая скобка [XYZ]"),
+        T3: _plan("Третья [2019]"),
+    })
+    seen: list[list] = []
+
+    def confirm(planned):
+        seen.append([p.url for p in planned])
+        return True
+
+    summary = run_review_batch(
+        [T1, T2, T3], resolve=fake.resolve, execute=fake.execute, confirm=confirm,
+        out=lambda _: None,
+    )
+
+    assert fake.resolved == [T1, T2, T3]   # разбор не остановился на ошибке
+    assert seen == [[T1, T3]]              # битая ссылка в план не попала
+    assert fake.executed == [T1, T3]
+    assert summary.counts[ERROR] == 1
+    assert summary.exit_code() == 1
+
+
+def test_review_all_not_logged_in_aborts_before_any_question():
+    fake = _FakeTwoPhase({T1: NotLoggedIn("нет признака логина"), T2: _plan()})
+    asked: list[int] = []
+
+    summary = run_review_batch(
+        [T1, T2], resolve=fake.resolve, execute=fake.execute,
+        confirm=lambda p: asked.append(1) or True, out=lambda _: None,
+    )
+
+    assert fake.resolved == [T1]   # до второй не дошли
+    assert asked == []             # плана не показывали
+    assert fake.executed == []
+    assert summary.aborted is True
+    assert summary.exit_code() == 2
+
+
+def test_review_all_isolates_errors_in_execution_phase():
+    fake = _FakeTwoPhase(
+        {T1: _plan(), T2: _plan(), T3: _plan()},
+        executed={T2: FsError("SMB недоступен")},
+    )
+
+    summary = run_review_batch(
+        [T1, T2, T3], resolve=fake.resolve, execute=fake.execute, confirm=_yes,
+        out=lambda _: None,
+    )
+
+    assert fake.executed == [T1, T2, T3]   # сбой T2 не помешал T3
+    assert [r.status for r in summary.results] == [OK, ERROR, OK]
+
+
+def test_review_all_nothing_resolved():
+    fake = _FakeTwoPhase({T1: ParseAmbiguous("нет года")})
+    lines: list[str] = []
+    asked: list[int] = []
+
+    summary = run_review_batch(
+        [T1], resolve=fake.resolve, execute=fake.execute,
+        confirm=lambda p: asked.append(1) or True, out=lines.append,
+    )
+
+    assert asked == []  # пустой план не подтверждают
+    assert any("нечего выполнять" in line for line in lines)
+    assert summary.exit_code() == 1
+
+
+def test_review_all_passes_force_to_execution():
+    fake = _FakeTwoPhase({T1: _plan(), T2: _plan()})
+
+    run_review_batch(
+        [T1, T2], resolve=fake.resolve, execute=fake.execute, confirm=_yes,
+        force=True, out=lambda _: None,
+    )
+
+    assert fake.forces == [True, True]

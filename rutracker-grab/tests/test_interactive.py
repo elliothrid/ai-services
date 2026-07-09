@@ -11,7 +11,12 @@ import io
 import pytest
 
 from rutracker_grab.errors import ParseAmbiguous
-from rutracker_grab.interactive import AutoPrompter, ConsolePrompter, resolve_questions
+from rutracker_grab.interactive import (
+    AutoPrompter,
+    ConsolePrompter,
+    ask_yes_no,
+    resolve_questions,
+)
 from rutracker_grab.rules import LocalRules
 from rutracker_grab.title.decisions import Question
 
@@ -202,3 +207,39 @@ def test_no_candidates_is_not_a_question():
 
     assert prompter.choose_cover([], has_img_right=False) is None
     assert lines == []
+
+
+# --- ask_yes_no: подтверждение плана --review-all (§9) ------------------------
+
+def _yes_no(answers: str, **kw) -> tuple[bool, list[str]]:
+    lines: list[str] = []
+    result = ask_yes_no("Выполнить?", stdin=io.StringIO(answers), out=lines.append, **kw)
+    return result, lines
+
+
+@pytest.mark.parametrize("answer", ["y", "yes", "да", "Д", "YES"])
+def test_yes_variants(answer):
+    assert _yes_no(f"{answer}\n")[0] is True
+
+
+@pytest.mark.parametrize("answer", ["n", "no", "нет", "Н"])
+def test_no_variants(answer):
+    assert _yes_no(f"{answer}\n")[0] is False
+
+
+def test_enter_takes_default():
+    assert _yes_no("\n")[0] is True
+    assert _yes_no("\n", default=False)[0] is False
+
+
+def test_reasks_on_garbage():
+    result, lines = _yes_no("может быть\ny\n")
+    assert result is True
+    assert sum("не понял" in line for line in lines) == 1
+
+
+def test_eof_means_no_even_when_default_yes():
+    # Закрытый пайп не должен молча запустить запись на диск и в qBittorrent.
+    result, lines = _yes_no("", default=True)
+    assert result is False
+    assert any("ввод закончился" in line for line in lines)

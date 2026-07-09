@@ -75,6 +75,7 @@ class BatchSummary:
 
     results: list[LinkResult] = field(default_factory=list)
     aborted: bool = False
+    cancelled: bool = False   # --review-all: пользователь не подтвердил план
 
     @property
     def counts(self) -> Counter:
@@ -96,6 +97,8 @@ class BatchSummary:
             "",
             f"итого: ok {counts[OK]}, skipped {counts[SKIPPED]}, error {counts[ERROR]}",
         ]
+        if self.cancelled:
+            out.append("план не подтверждён — ничего не выполнено")
         if self.aborted:
             out.append("батч прерван: не залогинены. Запустите: python -m rutracker_grab --login")
         if not self.failures:
@@ -128,6 +131,54 @@ def _topic_id_or_unknown(url: str) -> str:
         return "?"
 
 
+def _record_error(summary: BatchSummary, url: str, exc: BaseException) -> LinkResult:
+    result = LinkResult(
+        url=url,
+        status=ERROR,
+        topic_id=_topic_id_or_unknown(url),
+        error_type=type(exc).__name__,
+        reason=_reason(exc),
+    )
+    summary.results.append(result)
+    return result
+
+
+def _isolated(summary: BatchSummary, url: str, index: int, total: int, work, out):
+    """Выполнить `work()` с изоляцией §12. Вернуть `(ok, value)`.
+
+    Любое исключение, кроме `NotLoggedIn`, попадает в сводку — батч едет дальше.
+    `NotLoggedIn` ставит `aborted`: остальные ссылки упадут с той же ошибкой.
+    `KeyboardInterrupt` — `BaseException`, сюда не попадает: Ctrl+C работает.
+    """
+    try:
+        return True, work()
+    except NotLoggedIn as exc:
+        result = _record_error(summary, url, exc)
+        summary.aborted = True
+        out(result.progress_line(index, total))
+        return False, None
+    except Exception as exc:  # noqa: BLE001 — изоляция §12 сильнее аккуратности
+        # Необёрнутая ошибка библиотеки тоже не должна уносить батч. Имя класса
+        # уйдёт в сводку, и станет видно, что стоит обернуть явно.
+        result = _record_error(summary, url, exc)
+        out(result.progress_line(index, total))
+        return False, None
+
+
+def _record_report(summary: BatchSummary, url: str, plan, report, index, total, verbose, out) -> None:
+    result = LinkResult(
+        url=url,
+        status=SKIPPED if report.skipped else OK,
+        topic_id=_topic_id_or_unknown(url),
+        title=plan.clean,
+    )
+    summary.results.append(result)
+    out(result.progress_line(index, total))
+    if verbose:
+        for line in report.lines():
+            out(f"    {line}")
+
+
 def run_batch(
     links: list[str],
     *,
@@ -145,47 +196,88 @@ def run_batch(
     summary = BatchSummary()
     total = len(links)
     for index, url in enumerate(links, start=1):
-        try:
-            plan, report = grab(url, force=force)
-        except NotLoggedIn as exc:
-            result = LinkResult(
-                url=url,
-                status=ERROR,
-                topic_id=_topic_id_or_unknown(url),
-                error_type="NotLoggedIn",
-                reason=_reason(exc),
-            )
-            summary.results.append(result)
-            summary.aborted = True
-            out(result.progress_line(index, total))
-            break
-        except Exception as exc:  # noqa: BLE001 — изоляция §12 сильнее аккуратности
-            # GrabError ловим по классу; всё остальное (баг в коде, необёрнутая
-            # ошибка библиотеки) — тоже, иначе одна тема уносит весь батч. Имя
-            # класса попадёт в сводку, и станет видно, что стоит обернуть явно.
-            # KeyboardInterrupt — BaseException, сюда не попадает: Ctrl+C работает.
-            result = LinkResult(
-                url=url,
-                status=ERROR,
-                topic_id=_topic_id_or_unknown(url),
-                error_type=type(exc).__name__,
-                reason=_reason(exc),
-            )
-            summary.results.append(result)
-            out(result.progress_line(index, total))
+        ok, value = _isolated(summary, url, index, total, lambda u=url: grab(u, force=force), out)
+        if not ok:
+            if summary.aborted:
+                break
             continue
+        plan, report = value
+        _record_report(summary, url, plan, report, index, total, verbose, out)
 
-        result = LinkResult(
-            url=url,
-            status=SKIPPED if report.skipped else OK,
-            topic_id=_topic_id_or_unknown(url),
-            title=plan.clean,
+    for line in summary.lines():
+        out(line)
+    return summary
+
+
+@dataclass
+class PlannedLink:
+    """Ссылка, прошедшая фазу разбора: план готов, выполнение ещё не начиналось."""
+
+    url: str
+    topic_id: str
+    plan: object   # fetch._Plan; batch намеренно не знает его типа
+
+
+def run_review_batch(
+    links: list[str],
+    *,
+    resolve: Callable[[str], object],
+    execute: Callable[..., object],
+    confirm: Callable[[list[PlannedLink]], bool],
+    force: bool = False,
+    verbose: bool = False,
+    out: Callable[[str], None] = print,
+) -> BatchSummary:
+    """`--review-all`: сперва разобрать все ссылки, показать план, потом выполнять (§9).
+
+    Фаза 1 — `resolve(url)`: страница, заголовок, вопросы (если интерактив). Ничего
+    не пишет на диск и не трогает qBittorrent. Ошибки изолируются так же, как в
+    обычном батче, и в план не попадают.
+
+    Фаза 2 — `execute(url, plan, force=...)` только для подтверждённых ссылок.
+    Отказ от плана — не ошибка: exit-код определяется только сбоями фазы 1.
+    """
+    summary = BatchSummary()
+    total = len(links)
+    planned: list[PlannedLink] = []
+
+    for index, url in enumerate(links, start=1):
+        ok, plan = _isolated(summary, url, index, total, lambda u=url: resolve(u), out)
+        if not ok:
+            if summary.aborted:
+                for line in summary.lines():
+                    out(line)
+                return summary
+            continue
+        topic_id = _topic_id_or_unknown(url)
+        planned.append(PlannedLink(url=url, topic_id=topic_id, plan=plan))
+        out(f"[{index}/{total}] t={topic_id:<9} {'план':<8} {plan.clean}")
+
+    if not planned:
+        out("")
+        out("нечего выполнять: ни одна ссылка не разобралась")
+        for line in summary.lines():
+            out(line)
+        return summary
+
+    if not confirm(planned):
+        summary.cancelled = True
+        for line in summary.lines():
+            out(line)
+        return summary
+
+    out("")
+    executed = len(planned)
+    for index, item in enumerate(planned, start=1):
+        ok, report = _isolated(
+            summary, item.url, index, executed,
+            lambda i=item: execute(i.url, i.plan, force=force), out,
         )
-        summary.results.append(result)
-        out(result.progress_line(index, total))
-        if verbose:
-            for line in report.lines():
-                out(f"    {line}")
+        if not ok:
+            if summary.aborted:
+                break
+            continue
+        _record_report(summary, item.url, item.plan, report, index, executed, verbose, out)
 
     for line in summary.lines():
         out(line)

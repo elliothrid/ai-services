@@ -189,6 +189,36 @@ class ConsolePrompter:
         return None if choice == "n" else candidates[int(choice) - 1]
 
 
+def ask_yes_no(
+    question: str,
+    *,
+    default: bool = True,
+    stdin: TextIO | None = None,
+    out: Callable[[str], None] = print,
+) -> bool:
+    """Спросить да/нет. Нужен и без `--interactive` (подтверждение плана `--review-all`).
+
+    EOF -> `default=False` небезопасен, поэтому на EOF возвращаем `False`: закрытый
+    пайп не должен молча запускать запись на диск и в qBittorrent.
+    """
+    stream = stdin or sys.stdin
+    hint = "Y/n" if default else "y/N"
+    while True:
+        out(f"{question} [{hint}]: ")
+        line = stream.readline()
+        if line == "":
+            out("  ввод закончился — считаю за «нет»")
+            return False
+        raw = line.strip().lower()
+        if not raw:
+            return default
+        if raw in ("y", "yes", "д", "да"):
+            return True
+        if raw in ("n", "no", "н", "нет"):
+            return False
+        out(f"  ! не понял {raw!r}, ожидаю y или n")
+
+
 def resolve_questions(questions: list[Question], prompter: Prompter) -> bool:
     """Закрыть незакрытые решения. Вернуть True, если правила изменились.
 

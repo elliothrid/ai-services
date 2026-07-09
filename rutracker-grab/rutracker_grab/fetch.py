@@ -12,16 +12,23 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import Page, sync_playwright
 
 from . import config
-from .batch import read_links, run_batch
+from .batch import PlannedLink, read_links, run_batch, run_review_batch
 from .cover import save_cover
 from .env_adapter import local_dir, qbit_save_path, sanitize_leaf
 from .errors import FsError, NotLoggedIn, PageLoadError, ParseAmbiguous, TopicNotFound
-from .interactive import AutoPrompter, ConsolePrompter, Prompter, resolve_questions
+from .interactive import (
+    AutoPrompter,
+    ConsolePrompter,
+    Prompter,
+    ask_yes_no,
+    resolve_questions,
+)
 from .page_saver import save_page_mhtml
 from .reconcile import MHTML_NAME, Report, reconcile
 from .rules import LocalRules, load_rules
@@ -279,9 +286,9 @@ class _LiveDeps:
     этом может быть открыт, они не мешают друг другу.
     """
 
-    def __init__(self, context, page: Page, topic_id: str, prompter: Prompter):
+    def __init__(self, context, get_page: Callable[[], Page], topic_id: str, prompter: Prompter):
         self._context = context
-        self._page = page
+        self._get_page = get_page   # ленивый: в `--review-all` страница нужна не всегда
         self._topic_id = topic_id
         self._prompter = prompter
 
@@ -289,11 +296,11 @@ class _LiveDeps:
         return fetch_torrent_bytes(self._context, self._topic_id)
 
     def save_page(self, target: Path) -> Path:
-        return save_page_mhtml(self._page, target / MHTML_NAME)
+        return save_page_mhtml(self._get_page(), target / MHTML_NAME)
 
     def save_cover(self, target: Path) -> Path | None:
         chooser = self._prompter.choose_cover if self._prompter.enabled else None
-        return save_cover(self._page, self._context, target, chooser)
+        return save_cover(self._get_page(), self._context, target, chooser)
 
     def in_qbit(self, infohash: str) -> bool:
         return torrent_in_qbit(infohash)
@@ -325,14 +332,29 @@ def grab_one(
     prompter = prompter or AutoPrompter()
     tid = topic_id_from_url(url)
     plan = _resolve(page, url, prompter=prompter, rules=rules)
+    report = _execute(context, lambda: page, url, plan, force=force, prompter=prompter)
+    return plan, report
+
+
+def _execute(
+    context,
+    get_page: Callable[[], Page],
+    url: str,
+    plan: _Plan,
+    *,
+    force: bool,
+    prompter: Prompter,
+) -> Report:
+    """Реконсиляция по готовому плану. Страница берётся через `get_page` — лениво."""
+    tid = topic_id_from_url(url)
     try:
-        report = reconcile(
+        return reconcile(
             target=plan.target,
             leaf=plan.leaf,
             clean=plan.clean,
             qbit_save=plan.qbit_save,
             topic_id=tid,
-            deps=_LiveDeps(context, page, tid, prompter),
+            deps=_LiveDeps(context, get_page, tid, prompter),
             force=force,
         )
     except OSError as exc:  # SMB отвалился, нет прав, длинный путь (§12)
@@ -342,7 +364,39 @@ def grab_one(
             f"браузер не справился с темой t={tid}: "
             f"{type(exc).__name__}: {str(exc).splitlines()[0]}"
         ) from exc
-    return plan, report
+
+
+class _LazyPage:
+    """Вкладка, открываемая при первом обращении (§9, `--review-all`).
+
+    В фазе выполнения страница нужна только если недостаёт `About.mhtml` или
+    постера: `skipped`-тема не должна платить за навигацию. Логин перепроверяем
+    здесь же — между фазами сессия могла истечь.
+    """
+
+    def __init__(self, context, url: str):
+        self._context = context
+        self._url = url
+        self._page: Page | None = None
+
+    def get(self) -> Page:
+        if self._page is None:
+            page = self._context.new_page()
+            self._page = page
+            _goto(page, self._url)
+            if not is_logged_in(page):
+                raise NotLoggedIn(
+                    "Сессия истекла между разбором плана и выполнением.\n"
+                    "Запустите вход: python -m rutracker_grab --login"
+                )
+        return self._page
+
+    def close(self) -> None:
+        if self._page is not None:
+            try:
+                self._page.close()
+            except PlaywrightError:  # вкладка уже мертва — не мешаем следующей ссылке
+                pass
 
 
 def _make_prompter(interactive: bool) -> tuple[Prompter, LocalRules]:
@@ -387,6 +441,15 @@ def cmd_grab(
     return 0
 
 
+def _print_plan(planned: list[PlannedLink]) -> None:
+    print("")
+    print(f"План ({len(planned)}):")
+    for index, item in enumerate(planned, start=1):
+        print(f"  {index}) t={item.topic_id}")
+        print(f"     имя:   {item.plan.clean}")
+        print(f"     папка: {item.plan.target}")
+
+
 def cmd_batch(
     links_file: str,
     *,
@@ -394,12 +457,15 @@ def cmd_batch(
     verbose: bool = False,
     force: bool = False,
     interactive: bool = False,
+    review_all: bool = False,
 ) -> int:
     """`<links.txt>`: прогнать список ссылок в одном браузере и одной сессии qBittorrent.
 
     Один persistent-context и одно подключение к qBittorrent на весь батч (§3, п.5):
     поднимать браузер на каждую ссылку — секунды впустую, да и два процесса на одном
     профиле не уживаются. С `--interactive` вопросы задаются по ходу, на своей теме.
+    С `--review-all` сперва строится план по всей пачке, и без подтверждения на диск
+    и в qBittorrent не пишется ничего.
     """
     links = read_links(Path(links_file))
     if not links:
@@ -408,26 +474,50 @@ def cmd_batch(
 
     prompter, rules = _make_prompter(interactive)
 
-    def grab_in_fresh_page(url: str, *, force: bool = False):
+    def in_fresh_page(url: str, work):
         """Своя вкладка на ссылку: после таймаута `goto` в странице остаётся висящая
         навигация, и следующий `goto` встаёт за ней в очередь — одна битая ссылка
         утаскивала за собой все последующие. Контекст (cookie, профиль) общий."""
         page = context.new_page()
         try:
-            return grab_one(context, page, url, force=force, prompter=prompter, rules=rules)
+            return work(page)
         finally:
             try:
                 page.close()
             except PlaywrightError:  # вкладка уже мертва — не мешаем следующей ссылке
                 pass
 
+    def grab(url: str, *, force: bool = False):
+        return in_fresh_page(
+            url,
+            lambda page: grab_one(context, page, url, force=force, prompter=prompter, rules=rules),
+        )
+
+    def resolve(url: str) -> _Plan:
+        return in_fresh_page(url, lambda page: _resolve(page, url, prompter=prompter, rules=rules))
+
+    def execute(url: str, plan: _Plan, *, force: bool = False) -> Report:
+        pages = _LazyPage(context, url)   # skipped-тема браузер не поднимает
+        try:
+            return _execute(context, pages.get, url, plan, force=force, prompter=prompter)
+        finally:
+            pages.close()
+
+    def confirm(planned: list[PlannedLink]) -> bool:
+        _print_plan(planned)
+        return ask_yes_no(f"Выполнить {len(planned)} шт.?", default=True)
+
     with sync_playwright() as p:
         context = _launch_context(p, headless=not headed)
         try:
             with qbit_session():
-                summary = run_batch(
-                    links, grab=grab_in_fresh_page, force=force, verbose=verbose
-                )
+                if review_all:
+                    summary = run_review_batch(
+                        links, resolve=resolve, execute=execute, confirm=confirm,
+                        force=force, verbose=verbose,
+                    )
+                else:
+                    summary = run_batch(links, grab=grab, force=force, verbose=verbose)
         finally:
             context.close()
     return summary.exit_code()
