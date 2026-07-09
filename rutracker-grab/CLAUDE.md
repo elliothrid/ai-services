@@ -14,19 +14,22 @@
 - **Детерминизм по умолчанию.** LLM — только на «нечётких» местах (§5.2), за
   интерфейсом `normalize.py`; стартовый провайдер = `none` (правила + интерактив).
 - **Ничего не пишем на диск / в qBittorrent, минуя валидаторы-инварианты (§11).**
-- Инструмент интерактивный: если правило неоднозначно — спросить пользователя,
-  не угадывать молча.
+- Инструмент задуман интерактивным: если правило неоднозначно — спросить
+  пользователя, не угадывать молча. **`interactive.py` пока не написан**, поэтому
+  неоднозначность = ошибка `ParseAmbiguous`, тема пропускается (§9, §12).
 
-## Целевая структура (см. DESIGN.md §13)
+## Структура (см. DESIGN.md §13)
 ```
 rutracker_grab/
   __main__.py  config.py  env_adapter.py  fetch.py  batch.py  errors.py
   title/ (parse.py normalize.py lexicons.py validate.py)
-  cover.py  page_saver.py  torrent.py  interactive.py  state.py  reconcile.py
+  cover.py  page_saver.py  torrent.py  state.py  reconcile.py
+  interactive.py — НЕ НАПИСАН (§9)
 tests/
 ```
 
 Запуск батча: `python -m rutracker_grab links.txt` (см. `how_to_execute.txt`).
+CLI живёт в `__main__.py`; `python -m rutracker_grab.fetch` точкой входа НЕ является.
 Все ожидаемые ошибки наследуют `errors.GrabError` — батч ловит базовый класс.
 
 ## Ключевые инварианты (не нарушать)
@@ -41,6 +44,14 @@ tests/
   `glob`/`fnmatch`/`Path.glob()`/`rglob`: квадратные скобки трактуются как класс
   символов, поиск молча вернёт пусто. Только `Path.exists()`, `Path.iterdir()`
   (сравнение имён по `==`) или экранирование через `glob.escape()`.
+- В батче — своя вкладка на каждую ссылку. Переиспользовать один `page` НЕЛЬЗЯ:
+  после таймаута `goto` навигация остаётся висеть, следующий `goto` встаёт за ней
+  в очередь, и одна битая ссылка утаскивает все последующие. Контекст — общий.
+- Ошибки Playwright (`playwright.sync_api.Error`, включая `TimeoutError`) — НЕ
+  `GrabError`. Любой вызов браузера, идущий в батч, оборачивать в `PageLoadError`,
+  иначе изоляция §12 не работает. То же про голые `RuntimeError`/`ValueError`.
+- Явный `timeout=` на каждом `context.request.get`: дефолт Playwright — 30 с, а
+  через SOCKS5 и `dl.php`, и постеры с fastpic отвечают медленнее (§6).
 
 ## Правила очистки заголовка (решено, детерминированно)
 - Схлопывание языков: брать сегмент до первого ` / ` (в названии и в скобке режиссёра).
