@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rutracker-grab"
+version = "0.1.0"
+description = "Забирает раздачи с rutracker.org: чистит заголовок, раскладывает по папкам NAS, сохраняет страницу и постер, заводит закачку в qBittorrent."
+requires-python = ">=3.12"
+# Итерация 2a — Playwright; 2b — Pillow (постер); 2c — qbittorrent-api + dotenv.
+# Остальные зависимости (questionary/rich, claude-agent-sdk) — в следующих итерациях.
+dependencies = ["playwright", "Pillow", "qbittorrent-api", "python-dotenv"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[tool.setuptools.packages.find]
+include = ["rutracker_grab*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
