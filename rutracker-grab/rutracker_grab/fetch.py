@@ -16,18 +16,22 @@ from dataclasses import dataclass
 
 from playwright.sync_api import Page, sync_playwright
 
-from . import config
+from . import config, state
 from .cover import save_cover
 from .env_adapter import local_dir, qbit_save_path, sanitize_leaf
 from .page_saver import save_page_mhtml
 from .title.parse import parse_title
 from .title.validate import validate
 from .torrent import (
+    QbitAlreadyPresent,
+    QbitAuthError,
     QbitRejected,
     TorrentNotBittorrent,
     add_to_qbit,
-    download_torrent,
+    fetch_torrent_bytes,
     topic_id_from_url,
+    torrent_in_qbit,
+    torrent_infohash_v1,
 )
 
 LOGIN_URL = "https://rutracker.org/forum/login.php"
@@ -172,22 +176,19 @@ def cmd_probe(url: str, *, headed: bool = False, verbose: bool = False) -> int:
 
 
 @dataclass
-class _Artifacts:
-    """Результат общей части пайплайна (папка + страница + постер)."""
+class _Plan:
+    """Итог разбора темы: пути раздачи (ещё без записи на диск)."""
 
     clean: str
     leaf: str
     target: Path
     qbit_save: str
-    mhtml: Path
-    cover: Path | None
 
 
-def _save_artifacts(page: Page, context, url: str) -> _Artifacts:
-    """Общий шаг --dry-fetch/--grab: логин-чек -> parse -> §11 -> папка + mhtml + cover.
+def _resolve(page: Page, url: str) -> _Plan:
+    """Открыть тему, проверить логин, разобрать и провалидировать заголовок.
 
-    Открывает тему, валидирует заголовок и пишет папку/страницу/постер. Торрент и
-    qBittorrent сюда не входят.
+    Только вычисления и проверки — ничего на диск не пишет (нужно до идемпотент-чека).
     """
     page.goto(url, wait_until="load")
     if not is_logged_in(page):
@@ -205,12 +206,15 @@ def _save_artifacts(page: Page, context, url: str) -> _Artifacts:
 
     clean = parts.clean_title
     leaf = sanitize_leaf(clean)      # одна строка для обоих потребителей (§2)
-    target = local_dir(leaf)
+    return _Plan(clean, leaf, local_dir(leaf), qbit_save_path(leaf))
 
+
+def _write_artifacts(page: Page, context, target: Path) -> tuple[Path, Path | None]:
+    """Создать папку и сохранить `About.mhtml` + `folder.jpg`."""
     target.mkdir(parents=True, exist_ok=True)
     mhtml = save_page_mhtml(page, target / "About.mhtml")
     cover = save_cover(page, context, target)
-    return _Artifacts(clean, leaf, target, qbit_save_path(leaf), mhtml, cover)
+    return mhtml, cover
 
 
 def cmd_dry_fetch(url: str, *, headed: bool = False, verbose: bool = False) -> int:
@@ -222,48 +226,88 @@ def cmd_dry_fetch(url: str, *, headed: bool = False, verbose: bool = False) -> i
         context = _launch_context(p, headless=not headed)
         page = context.new_page()
         try:
-            art = _save_artifacts(page, context, url)
+            plan = _resolve(page, url)
+            mhtml, cover = _write_artifacts(page, context, plan.target)
             if verbose:
                 _print_diagnostics(context, page)
         finally:
             context.close()
 
-    print(f"clean:     {art.clean}")
-    print(f"leaf:      {art.leaf}")
-    print(f"local_dir: {art.target}")
-    print(f"qbit_save: {art.qbit_save}")
-    print(f"mhtml:     {art.mhtml.name}")
-    print(f"cover:     {art.cover.name if art.cover else '<не найден postImg.img-right>'}")
+    print(f"clean:     {plan.clean}")
+    print(f"leaf:      {plan.leaf}")
+    print(f"local_dir: {plan.target}")
+    print(f"qbit_save: {plan.qbit_save}")
+    print(f"mhtml:     {mhtml.name}")
+    print(f"cover:     {cover.name if cover else '<не найден postImg.img-right>'}")
     return 0
 
 
-def cmd_grab(url: str, *, headed: bool = False, verbose: bool = False) -> int:
-    """`--grab <url>`: полный пайплайн — папка -> About.mhtml -> folder.jpg ->
-    `<leaf>.torrent` -> закачка в qBittorrent на паузе."""
+def cmd_grab(
+    url: str, *, headed: bool = False, verbose: bool = False, force: bool = False
+) -> int:
+    """`--grab <url>`: полный пайплайн с идемпотентностью (§10).
+
+    Папка -> About.mhtml -> folder.jpg -> `<leaf>.torrent` -> закачка на паузе.
+    Пропускает работу (skipped, exit 0), если тема уже забрана: по манифесту
+    `.grab.json` или по наличию хеша в qBittorrent. `--force` игнорирует манифест.
+    """
     tid = topic_id_from_url(url)
+    mhtml: Path | None = None
+    cover: Path | None = None
     with sync_playwright() as p:
         context = _launch_context(p, headless=not headed)
         page = context.new_page()
         try:
-            art = _save_artifacts(page, context, url)
-            # Торрент — тем же контекстом (те же cookie/прокси), с Referer (§8).
-            torrent = download_torrent(context, tid, art.target / f"{art.leaf}.torrent")
+            plan = _resolve(page, url)
+
+            # 1) Идемпотентность по манифесту (только exists(), без glob — §10).
+            if state.should_skip(plan.target, tid, force=force):
+                print(f"skipped: тема уже забрана (манифест {state.MANIFEST_NAME} в {plan.target})")
+                return 0
+
+            # 2) Скачать .torrent во временный буфер и посчитать infohash до записи.
+            data = fetch_torrent_bytes(context, tid)
+            infohash = torrent_infohash_v1(data)
+
+            # 3) Дубль в qBittorrent? Тогда артефакты не перезаписываем (§10).
+            if torrent_in_qbit(infohash):
+                print(f"skipped: раздача уже в qBittorrent (hash={infohash})")
+                return 0
+
+            # 4) Не дубль — пишем артефакты и .torrent.
+            mhtml, cover = _write_artifacts(page, context, plan.target)
+            torrent = plan.target / f"{plan.leaf}.torrent"
+            torrent.write_bytes(data)
             if verbose:
                 _print_diagnostics(context, page)
         finally:
             context.close()
 
-    # qBittorrent — напрямую по LAN, без SOCKS5-прокси (§6a).
-    torrent_hash = add_to_qbit(torrent, art.qbit_save, art.clean)
+    # 5) Добавить в qBittorrent (напрямую по LAN, без прокси — §6a).
+    try:
+        torrent_hash = add_to_qbit(torrent, plan.qbit_save, plan.clean)
+    except QbitAlreadyPresent as exc:
+        # Гонка: между дубль-чеком и add раздачу успели добавить — это skipped.
+        print(f"skipped: {exc}")
+        return 0
 
-    print(f"clean:     {art.clean}")
-    print(f"leaf:      {art.leaf}")
-    print(f"local_dir: {art.target}")
-    print(f"qbit_save: {art.qbit_save}")
-    print(f"mhtml:     {art.mhtml.name}")
-    print(f"cover:     {art.cover.name if art.cover else '<не найден postImg.img-right>'}")
+    # 6) Манифест — после успешного добавления (§10).
+    state.write_manifest(
+        plan.target,
+        topic_id=tid,
+        clean_title=plan.clean,
+        torrent_hash=torrent_hash or infohash,
+    )
+
+    print(f"clean:     {plan.clean}")
+    print(f"leaf:      {plan.leaf}")
+    print(f"local_dir: {plan.target}")
+    print(f"qbit_save: {plan.qbit_save}")
+    print(f"mhtml:     {mhtml.name}")
+    print(f"cover:     {cover.name if cover else '<не найден postImg.img-right>'}")
     print(f"torrent:   {torrent.name}")
-    print(f"qbit:      добавлено на паузе (hash={torrent_hash or 'n/a'})")
+    print(f"qbit:      добавлено на паузе (hash={torrent_hash or infohash})")
+    print(f"manifest:  {state.MANIFEST_NAME}")
     return 0
 
 
@@ -301,6 +345,11 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="для --probe: печатать блок диагностики (profile/url/title/body/cookies)",
     )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="для --grab: игнорировать манифест .grab.json и перезаписать (§10)",
+    )
     args = parser.parse_args(argv)
 
     if args.login:
@@ -309,7 +358,9 @@ def main(argv: list[str] | None = None) -> int:
         if args.dry_fetch:
             return cmd_dry_fetch(args.dry_fetch, headed=args.headed, verbose=args.verbose)
         if args.grab:
-            return cmd_grab(args.grab, headed=args.headed, verbose=args.verbose)
+            return cmd_grab(
+                args.grab, headed=args.headed, verbose=args.verbose, force=args.force
+            )
         return cmd_probe(args.probe, headed=args.headed, verbose=args.verbose)
     except NotLoggedIn as exc:
         print(f"Ошибка: {exc}", file=sys.stderr)
@@ -320,9 +371,12 @@ def main(argv: list[str] | None = None) -> int:
     except TorrentNotBittorrent as exc:
         print(f"Ошибка: {exc}", file=sys.stderr)
         return 4
-    except QbitRejected as exc:
+    except QbitAuthError as exc:
         print(f"Ошибка: {exc}", file=sys.stderr)
         return 5
+    except QbitRejected as exc:
+        print(f"Ошибка: {exc}", file=sys.stderr)
+        return 6
 
 
 if __name__ == "__main__":

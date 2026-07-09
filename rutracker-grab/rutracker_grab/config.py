@@ -23,6 +23,9 @@ QBIT_WEBUI = "http://192.168.0.169:9866"
 QBIT_USER = os.environ.get("QBIT_USER", "admin")
 QBIT_PASSWORD = os.environ.get("QBIT_PASSWORD", "")
 
+# Версия правил очистки заголовка — пишется в манифест .grab.json (§10).
+RULES_VERSION = 1
+
 # Сеть: Happ как локальный SOCKS5, только для Playwright (§6a).
 SOCKS5_PORT = 10808
 SOCKS5_PROXY = f"socks5://127.0.0.1:{SOCKS5_PORT}"
